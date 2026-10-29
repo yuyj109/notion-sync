@@ -231,14 +231,14 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 	for _, f := range files {
 		key := "file:" + f.Path
 		live[key] = true
-		title := pageTitle(f.Body, f.Path)
+		title := pageTitle(f.SyncBody, f.Path)
 		a := Action{Key: key, Path: f.Path, Title: title, File: f}
 		var splitErr error
-		a.Body, _, splitErr = bodyWithoutImages(f.Body, f.Path)
+		a.Body, _, splitErr = bodyWithoutImages(f.SyncBody, f.Path)
 		if splitErr != nil {
 			return plan, splitErr
 		}
-		a.TextParts, splitErr = imageTextParts(f.Body)
+		a.TextParts, splitErr = imageTextParts(f.SyncBody)
 		if splitErr != nil {
 			return plan, splitErr
 		}
@@ -353,11 +353,11 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 			if err != nil {
 				return plan, err
 			}
-			if m.Markdown != "" && m.Markdown != f.Body {
+			if m.Markdown != "" && m.Markdown != f.SyncBody {
 				return plan, fmt.Errorf("%s: existing page has content and no synchronization baseline", f.Path)
 			}
 			a.Entry = Entry{PageID: f.PageID, ParentID: pid, ParentType: ptype, Target: a.Target, RemoteHash: remoteMarkdownHash(m.Markdown)}
-			if m.Markdown == f.Body {
+			if m.Markdown == f.SyncBody {
 				a.Kind = "adopt"
 			} else {
 				a.Kind = "update"
@@ -390,7 +390,7 @@ func appendImages(ctx context.Context, api Client, pageID string, action Action,
 	if !uploadOK {
 		return nil, fmt.Errorf("file uploads are not supported by the Notion client")
 	}
-	if _, _, err := bodyWithoutImages(action.File.Body, action.Path); err != nil {
+	if _, _, err := bodyWithoutImages(action.File.SyncBody, action.Path); err != nil {
 		return nil, err
 	}
 	if len(action.TextParts) > 0 && len(action.TextParts) != len(action.File.Images)+1 {

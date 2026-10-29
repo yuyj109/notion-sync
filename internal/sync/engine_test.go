@@ -291,6 +291,51 @@ func TestPageTitle(t *testing.T) {
 	}
 }
 
+func TestHTMLCommentsExcludedFromSync(t *testing.T) {
+	for _, tc := range []struct{ name, input, want string }{
+		{"inline", "before <!-- hidden --> after", "before  after"},
+		{"multiline", "one\n<!-- hidden\n![x](missing.png)\n-->\ntwo\n", "one\n\n\n\ntwo\n"},
+		{"fenced", "```html\n<!-- example -->\n```\n<!-- hidden -->", "```html\n<!-- example -->\n```\n"},
+		{"quoted fence", "> ```html\n> <!-- example -->\n> ```\n> <!-- hidden -->", "> ```html\n> <!-- example -->\n> ```\n> "},
+		{"list comment", "- item\n    <!-- hidden -->\n", "- item\n    \n"},
+		{"inline code", "`<!-- example -->` <!-- hidden -->", "`<!-- example -->` "},
+		{"indented code", "    <!-- example -->\n<!-- hidden -->", "    <!-- example -->\n"},
+		{"escaped", `\<!-- example -->`, `\<!-- example -->`},
+		{"unclosed", "before <!-- hidden", "before "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := withoutHTMLComments(tc.input); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+	c, api, dir := setup(t)
+	file := filepath.Join(dir, "guide.md")
+	write(t, file, "# Guide\n<!-- cms-doc:manual id=\"notes\" -->\n<!-- ![x](missing.png) -->\nVisible\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	if api.creates != 1 {
+		t.Fatalf("created %d pages", api.creates)
+	}
+	for id, page := range api.pages {
+		if id != norm(rootID) && (strings.Contains(page.content, "<!--") || !strings.Contains(page.content, "Visible")) {
+			t.Fatalf("synced content = %q", page.content)
+		}
+	}
+	local := string(mustRead(t, file))
+	if !strings.Contains(local, "<!-- cms-doc:manual") {
+		t.Fatal("local comment was removed")
+	}
+	write(t, file, strings.Replace(local, `id="notes"`, `id="other"`, 1))
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	if api.updates != 0 {
+		t.Fatalf("comment-only change updated Notion %d times", api.updates)
+	}
+}
+
 func TestLocalImageScanAndCreate(t *testing.T) {
 	c, api, dir := setup(t)
 	imgDir := filepath.Join(dir, "images")

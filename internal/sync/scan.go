@@ -15,12 +15,16 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/text"
 	"github.com/yuyj109/notion-sync/internal/config"
 	"gopkg.in/yaml.v3"
 )
 
 type File struct {
 	Path, Body, Hash, PageID, ParentID, DatabaseID string
+	SyncBody                                       string
 	Raw                                            []byte
 	Images                                         []Image
 	Metadata                                       *Metadata
@@ -35,6 +39,68 @@ type Image struct {
 
 var localImageRE = regexp.MustCompile(`^!\[([^\]]*)\]\((<[^>]+>|[^\s)]+)(?:\s+"([^"]*)")?\)$`)
 var remoteImageRE = regexp.MustCompile(`!\[([^\]]*)\]\((<[^>]+>|[^\s)]+)(\s+"[^"]*")?\)`)
+
+// withoutHTMLComments removes HTML comments while preserving Markdown code examples.
+func withoutHTMLComments(body string) string {
+	source := []byte(body)
+	protected := make([]bool, len(source))
+	protect := func(start, stop int) {
+		for i := start; i < stop && i < len(protected); i++ {
+			protected[i] = true
+		}
+	}
+	document := goldmark.DefaultParser().Parse(text.NewReader(source))
+	_ = ast.Walk(document, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		switch node.Kind() {
+		case ast.KindCodeBlock, ast.KindFencedCodeBlock:
+			lines := node.Lines()
+			for i := 0; i < lines.Len(); i++ {
+				segment := lines.At(i)
+				protect(segment.Start, segment.Stop)
+			}
+		case ast.KindCodeSpan:
+			for child := node.FirstChild(); child != nil; child = child.NextSibling() {
+				if part, ok := child.(*ast.Text); ok {
+					protect(part.Segment.Start, part.Segment.Stop)
+				}
+			}
+		}
+		return ast.WalkContinue, nil
+	})
+	var out strings.Builder
+	for i := 0; i < len(body); {
+		if !protected[i] && strings.HasPrefix(body[i:], "<!--") && !escapedAt(body, i) {
+			end := strings.Index(body[i+4:], "-->")
+			if end < 0 {
+				end = len(body)
+			} else {
+				end += i + 7
+			}
+			for j := i; j < end; j++ {
+				if body[j] == '\n' || body[j] == '\r' && j+1 < end && body[j+1] == '\n' {
+					out.WriteByte(body[j])
+				}
+			}
+			i = end
+			continue
+		}
+		out.WriteByte(body[i])
+		i++
+	}
+	return out.String()
+}
+
+func escapedAt(body string, i int) bool {
+	n := 0
+	for i > 0 && body[i-1] == '\\' {
+		n++
+		i--
+	}
+	return n%2 != 0
+}
 
 // remoteMarkdownHash ignores expiring query signatures in Notion-hosted image URLs.
 func remoteMarkdownHash(body string) string {
@@ -363,6 +429,7 @@ func parse(data []byte) (File, error) {
 		return f, err
 	}
 	f.Body = body
+	f.SyncBody = withoutHTMLComments(body)
 	seen := map[string]bool{}
 	node := root.Content[0]
 	for i := 0; i < len(node.Content); i += 2 {
@@ -395,17 +462,17 @@ func parse(data []byte) (File, error) {
 	if f.ParentID != "" && f.DatabaseID != "" {
 		return f, fmt.Errorf("notion-parent-page-id and notion-database-id are mutually exclusive")
 	}
-	f.Hash = hash(f.Body)
+	f.Hash = hash(f.SyncBody)
 	return f, nil
 }
 
 func resolveImages(f *File, sourceRoot string) error {
-	images, err := localImages(f.Body, f.Path, sourceRoot)
+	images, err := localImages(f.SyncBody, f.Path, sourceRoot)
 	if err != nil {
 		return err
 	}
 	f.Images = images
-	if _, _, err := bodyWithoutImages(f.Body, f.Path); err != nil {
+	if _, _, err := bodyWithoutImages(f.SyncBody, f.Path); err != nil {
 		return err
 	}
 	return nil

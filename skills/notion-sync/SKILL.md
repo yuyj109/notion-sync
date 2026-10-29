@@ -5,7 +5,7 @@ description: Use the notion-sync CLI to search and view Notion pages and databas
 
 # notion-sync
 
-Use `notion-sync` for local Markdown → Notion synchronization and supported page/database operations. Consult the project's README for current options and limitations; use `notion-sync <command> --help` when details are unclear. If the binary is unavailable, report the prerequisite or, from the project checkout, use `go run .` in place of `notion-sync`.
+Use `notion-sync` for local Markdown → Notion synchronization and supported page/database operations. HTML comments are excluded from synchronized content but retained in the local file; code examples remain. Consult the project's README for current options and limitations; use `notion-sync <command> --help` when details are unclear. If the binary is unavailable, report the prerequisite or, from the project checkout, use `go run .` in place of `notion-sync`.
 
 ## Prerequisites
 

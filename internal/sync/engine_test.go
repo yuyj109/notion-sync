@@ -23,6 +23,7 @@ type fakeAPI struct {
 	blockUpdateBody  map[string]any
 	failCreate       bool
 	failMarkdown     bool
+	failUpdate       bool
 	onUpdate         func()
 	titles           []string
 	imageBlocks      []map[string]any
@@ -89,6 +90,9 @@ func (f *fakeAPI) API(_ context.Context, method, endpoint string, body any, out 
 		return copyResult(map[string]any{"object": "page", "id": id, "parent": map[string]any{"type": parentType, parentType: p.parent}})
 	}
 	if method == "PATCH" {
+		if f.failUpdate {
+			return errors.New("update failed")
+		}
 		f.updates++
 		b := body.(map[string]any)
 		if b["type"] == "insert_content" {
@@ -151,6 +155,116 @@ func run(c config.Config, api *fakeAPI, apply bool) error {
 	return Run(context.Background(), c, api, apply, func(string, ...any) {})
 }
 
+func TestSyncResolvesRelativeLinksAfterCreatingPages(t *testing.T) {
+	c, api, dir := setup(t)
+	a := filepath.Join(dir, "a.md")
+	b := filepath.Join(dir, "child", "b.md")
+	write(t, a, "[child](./child/b.md)\n`[code](./child/b.md)`\n```\n[code](./child/b.md)\n```\n[missing](./missing.md)\n")
+	write(t, b, "[back](../a.md)\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aID, bID := s.Entries["file:a.md"].PageID, s.Entries["file:child/b.md"].PageID
+	content := api.pages[norm(aID)].content
+	if !strings.Contains(content, `<mention-page url="`+pageURL(bID)+`">child</mention-page>`) || !strings.Contains(content, "`[code](./child/b.md)`") || !strings.Contains(content, "[missing](./missing.md)") || !strings.Contains(content, "```\n[code](./child/b.md)\n```") {
+		t.Fatalf("unexpected content: %q", content)
+	}
+	if !strings.Contains(api.pages[norm(bID)].content, `<mention-page url="`+pageURL(aID)+`">back</mention-page>`) {
+		t.Fatal("back link was not resolved")
+	}
+	if !strings.Contains(string(mustRead(t, a)), "[child](./child/b.md)") {
+		t.Fatal("source link changed")
+	}
+	updates := api.updates
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	if api.updates != updates {
+		t.Fatal("second sync updated unchanged pages")
+	}
+}
+
+func TestSyncResumesAfterEmptyPageCreation(t *testing.T) {
+	c, api, dir := setup(t)
+	write(t, filepath.Join(dir, "a.md"), "[b](./b.md)\n")
+	write(t, filepath.Join(dir, "b.md"), "body\n")
+	api.failUpdate = true
+	if err := run(c, api, true); err == nil {
+		t.Fatal("expected update failure")
+	}
+	if api.creates != 2 {
+		t.Fatalf("created %d pages", api.creates)
+	}
+	api.failUpdate = false
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	if api.creates != 2 {
+		t.Fatal("retry created duplicate pages")
+	}
+	s, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := api.pages[norm(s.Entries["file:a.md"].PageID)]
+	if !strings.Contains(a.content, pageURL(s.Entries["file:b.md"].PageID)) {
+		t.Fatalf("link not resolved: %q", a.content)
+	}
+}
+
+func TestSyncUpdatesLinkWhenTargetIsAdded(t *testing.T) {
+	c, api, dir := setup(t)
+	write(t, filepath.Join(dir, "a.md"), "[b](./child/b.md)\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dir, "child", "b.md"), "body\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := api.pages[norm(s.Entries["file:a.md"].PageID)]
+	if !strings.Contains(a.content, pageURL(s.Entries["file:child/b.md"].PageID)) {
+		t.Fatalf("link not updated: %q", a.content)
+	}
+}
+
+func TestSyncLinkAndImage(t *testing.T) {
+	c, base, dir := setup(t)
+	api := &fakeUploader{fakeAPI: base}
+	write(t, filepath.Join(dir, "a.md"), "[b](./b.md)\n\n![image](./image.png)\n\n[again](./b.md)\n")
+	write(t, filepath.Join(dir, "b.md"), "body\n")
+	write(t, filepath.Join(dir, "image.png"), "image")
+	if err := Run(context.Background(), c, api, true, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := api.pages[norm(s.Entries["file:a.md"].PageID)].content
+	if strings.Count(content, pageURL(s.Entries["file:b.md"].PageID)) != 2 || api.uploads != 1 {
+		t.Fatalf("content %q, uploads %d", content, api.uploads)
+	}
+}
+
+func TestResolveLinksEscapesMentionLabel(t *testing.T) {
+	id := "11111111-1111-1111-1111-111111111111"
+	docs := map[string]*File{"b.md": {PageID: id}}
+	got := resolveLinks("[A & B](./b.md)", "a.md", docs, nil)
+	want := `<mention-page url="` + pageURL(id) + `">A &amp; B</mention-page>`
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 type directoryDatabaseAPI struct{ *fakeAPI }
 
 func (f directoryDatabaseAPI) API(ctx context.Context, method, endpoint string, body, out any) error {
@@ -188,8 +302,8 @@ func TestDirectoryDatabaseSync(t *testing.T) {
 			t.Fatal("dry run wrote to Notion")
 		}
 	}
-	if base.creates != 2 || base.updates != 0 {
-		t.Fatalf("expected two database entries and no updates, got %d creates and %d updates", base.creates, base.updates)
+	if base.creates != 2 || base.updates != 2 {
+		t.Fatalf("expected two database entries and two content updates, got %d creates and %d updates", base.creates, base.updates)
 	}
 	for _, page := range base.pages {
 		if page.parentType != "" && (page.parentType != "data_source_id" || page.parent != "22222222-2222-2222-2222-222222222222") {
@@ -248,7 +362,7 @@ func TestLifecycleAndConflict(t *testing.T) {
 	if err := run(c, api, true); err != nil {
 		t.Fatal(err)
 	}
-	if api.creates != 2 || api.updates != 0 {
+	if api.creates != 2 || api.updates != 1 {
 		t.Fatal("second sync was not idempotent")
 	}
 	data, _ = os.ReadFile(file)
@@ -256,7 +370,7 @@ func TestLifecycleAndConflict(t *testing.T) {
 	if err := run(c, api, true); err != nil {
 		t.Fatal(err)
 	}
-	if api.updates != 1 {
+	if api.updates != 2 {
 		t.Fatal("expected update")
 	}
 	s, err := loadState(c)
@@ -267,8 +381,68 @@ func TestLifecycleAndConflict(t *testing.T) {
 	if err := run(c, api, true); err == nil || !strings.Contains(err.Error(), "changed in Notion") {
 		t.Fatalf("expected conflict, got %v", err)
 	}
-	if api.updates != 1 {
+	if api.updates != 2 {
 		t.Fatal("conflict caused a write")
+	}
+}
+
+func TestOverwriteRemoteChanges(t *testing.T) {
+	c, api, dir := setup(t)
+	write(t, filepath.Join(dir, "a.md"), "local\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := s.Entries["file:a.md"].PageID
+	api.pages[norm(id)].content = "edited in Notion"
+	if err := run(c, api, true); err == nil {
+		t.Fatal("expected conflict")
+	}
+	before := api.updates
+	if err := Run(context.Background(), c, api, false, func(string, ...any) {}, true); err != nil {
+		t.Fatal(err)
+	}
+	if api.updates != before {
+		t.Fatal("dry run wrote to Notion")
+	}
+	if err := Run(context.Background(), c, api, true, func(string, ...any) {}, true); err != nil {
+		t.Fatal(err)
+	}
+	if api.pages[norm(id)].content != "local\n" {
+		t.Fatal("local content did not replace remote content")
+	}
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOverwriteRejectsChangesAfterPlanning(t *testing.T) {
+	c, api, dir := setup(t)
+	write(t, filepath.Join(dir, "a.md"), "local\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := *s.Documents["a.md"]
+	s.Active[f.Path] = true
+	id := s.Entries["file:a.md"].PageID
+	api.pages[norm(id)].content = "first edit"
+	p, err := Build(context.Background(), c, api, []File{f}, s, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.pages[norm(id)].content = "second edit"
+	if err := Apply(context.Background(), c, api, &s, p, func(string, ...any) {}); err == nil {
+		t.Fatal("expected conflict after planning")
+	}
+	if api.pages[norm(id)].content != "second edit" {
+		t.Fatal("later edit was overwritten")
 	}
 }
 
@@ -331,7 +505,7 @@ func TestHTMLCommentsExcludedFromSync(t *testing.T) {
 	if err := run(c, api, true); err != nil {
 		t.Fatal(err)
 	}
-	if api.updates != 0 {
+	if api.updates != 1 {
 		t.Fatalf("comment-only change updated Notion %d times", api.updates)
 	}
 }
@@ -669,7 +843,7 @@ func TestFrontmatterPreservesMetadataAndBody(t *testing.T) {
 	if err = run(c, api, true); err != nil {
 		t.Fatal(err)
 	}
-	if api.creates != 1 || api.updates != 0 {
+	if api.creates != 1 || api.updates != 1 {
 		t.Fatal("not idempotent")
 	}
 }
@@ -891,7 +1065,7 @@ func TestConcurrentEditDoesNotBlockSavingOtherFile(t *testing.T) {
 	if !strings.Contains(string(mustRead(t, b)), "edited during sync") {
 		t.Fatal("concurrent edit was overwritten")
 	}
-	if api.updates != 1 {
+	if api.updates != 3 {
 		t.Fatalf("expected one update, got %d", api.updates)
 	}
 }
@@ -941,7 +1115,7 @@ func TestRootIDUsesHyphensAndNormalizesExistingFrontmatter(t *testing.T) {
 	if !strings.Contains(string(mustRead(t, file)), "notion-root-id: "+rootID) {
 		t.Fatal("existing root ID was not formatted")
 	}
-	if api.creates != 1 || api.updates != 0 {
+	if api.creates != 1 || api.updates != 1 {
 		t.Fatal("normalization wrote to Notion")
 	}
 }

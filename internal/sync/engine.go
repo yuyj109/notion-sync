@@ -3,6 +3,7 @@ package sync
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -47,6 +48,7 @@ type Action struct {
 	Entry                                                                             Entry
 	Body                                                                              string
 	TextParts                                                                         []string
+	Overwrite                                                                         bool
 }
 type Plan struct {
 	Actions []Action
@@ -127,6 +129,13 @@ func ResolveDataSource(ctx context.Context, api Client, id string) (string, stri
 	}
 	return ds, title, nil
 }
+
+type remoteChangedError struct{ pageID string }
+
+func (e *remoteChangedError) Error() string {
+	return fmt.Sprintf("page %s has changed in Notion; review it and use sync --overwrite to replace it with local content", e.pageID)
+}
+
 func validateExisting(ctx context.Context, api Client, e Entry) (markdown, error) {
 	p, err := getPage(ctx, api, e.PageID)
 	if err != nil {
@@ -144,11 +153,11 @@ func validateExisting(ctx context.Context, api Client, e Entry) (markdown, error
 		return m, err
 	}
 	if remoteMarkdownHash(m.Markdown) != e.RemoteHash {
-		return m, fmt.Errorf("page %s has changed in Notion", e.PageID)
+		return m, &remoteChangedError{pageID: e.PageID}
 	}
 	return m, nil
 }
-func Build(ctx context.Context, c config.Config, api Client, files []File, s State) (Plan, error) {
+func Build(ctx context.Context, c config.Config, api Client, files []File, s State, overwrite ...bool) (Plan, error) {
 	plan := Plan{}
 	if c.Notion.ParentDatabaseID != "" {
 		if _, _, err := ResolveDataSource(ctx, api, c.Notion.ParentDatabaseID); err != nil {
@@ -311,10 +320,21 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 			if e.Target != a.Target || a.ParentID != "" && norm(e.ParentID) != norm(a.ParentID) || f.PageID != "" && norm(e.PageID) != norm(f.PageID) {
 				return plan, fmt.Errorf("%s: destination changed; resolve manually", f.Path)
 			}
-			if _, err := validateExisting(ctx, api, e); err != nil {
-				return plan, fmt.Errorf("%s: %w", f.Path, err)
+			m, err := validateExisting(ctx, api, e)
+			conflict := false
+			if err != nil {
+				var changed *remoteChangedError
+				if !errors.As(err, &changed) || len(overwrite) == 0 || !overwrite[0] {
+					return plan, fmt.Errorf("%s: %w", f.Path, err)
+				}
+				conflict = true
+				a.Overwrite = true
+				e.RemoteHash = remoteMarkdownHash(m.Markdown)
+				a.Entry = e
 			}
-			if f.Hash == e.LocalHash {
+			if conflict {
+				a.Kind = "update"
+			} else if f.Hash == e.LocalHash {
 				if len(changedImages(f.Images, e.ImageHashes)) > 0 {
 					a.Kind = "images-update"
 				} else {
@@ -553,7 +573,9 @@ func printPlan(p Plan, print func(string, ...any)) {
 					destination = a.ParentType + ":" + a.ParentID
 				}
 			}
-			if a.Kind == "images-update" {
+			if a.Overwrite {
+				print("overwrite %s -> %s (Notion content changed)", a.Path, destination)
+			} else if a.Kind == "images-update" {
 				images := changedImages(a.File.Images, a.Entry.ImageHashes)
 				print("update images (%d) %s -> %s", len(images), a.Path, destination)
 			} else if len(a.File.Images) > 0 && (a.Kind == "unchanged" || a.Kind == "normalize") {
@@ -761,7 +783,7 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 	}
 	return nil
 }
-func Run(ctx context.Context, c config.Config, api Client, apply bool, print func(string, ...any)) error {
+func Run(ctx context.Context, c config.Config, api Client, apply bool, print func(string, ...any), overwrite ...bool) error {
 	var unlock func()
 	if apply {
 		var err error
@@ -785,7 +807,8 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 			s.Active[stored.Path] = true
 		}
 	}
-	p, err := Build(ctx, c, api, files, s)
+	prepareLinks(files, s)
+	p, err := Build(ctx, c, api, files, s, overwrite...)
 	if err != nil {
 		return err
 	}
@@ -793,11 +816,40 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 	if !apply {
 		return nil
 	}
+	// Create every new page before resolving links, so forward and cyclic links
+	// have a page ID. A distinct baseline makes an interrupted shell creation
+	// resume as an ordinary content update on the next run.
+	shells := Plan{}
+	for _, a := range p.Actions {
+		switch a.Kind {
+		case "directory-create", "directory-existing":
+			shells.Actions = append(shells.Actions, a)
+		case "create":
+			a.Body = ""
+			a.TextParts = nil
+			a.File.Images = nil
+			a.File.Hash = hash("notion-sync:empty-page-awaiting-content")
+			shells.Actions = append(shells.Actions, a)
+		}
+	}
+	if len(shells.Actions) > 0 {
+		if err := Apply(ctx, c, api, &s, shells, print); err != nil {
+			return err
+		}
+		for i := range files {
+			files[i] = *s.Documents[files[i].Path]
+		}
+		prepareLinks(files, s)
+		p, err = Build(ctx, c, api, files, s, overwrite...)
+		if err != nil {
+			return err
+		}
+	}
 	return Apply(ctx, c, api, &s, p, print)
 }
 
 // RunFile limits synchronization to one scanned file; other state entries are retained.
-func RunFile(ctx context.Context, c config.Config, api Client, filename, parentID, databaseID string, apply bool, print func(string, ...any)) error {
+func RunFile(ctx context.Context, c config.Config, api Client, filename, parentID, databaseID string, apply bool, print func(string, ...any), overwrite ...bool) error {
 	if parentID != "" && databaseID != "" {
 		return fmt.Errorf("--parent and --parent-db are mutually exclusive")
 	}
@@ -868,13 +920,14 @@ func RunFile(ctx context.Context, c config.Config, api Client, filename, parentI
 	}
 	selected[0] = *stored
 	s.Active[rel] = true
+	prepareLinks(selected, s)
 	if parentID != "" || databaseID != "" {
 		if selected[0].ParentID != "" || selected[0].DatabaseID != "" || selected[0].PageID != "" && selected[0].Metadata == nil {
 			return fmt.Errorf("destination flags cannot be combined with explicit frontmatter destination")
 		}
 		selected[0].ParentID, selected[0].DatabaseID = parentID, databaseID
 	}
-	p, err := Build(ctx, c, api, selected, s)
+	p, err := Build(ctx, c, api, selected, s, overwrite...)
 	if err != nil {
 		return err
 	}

@@ -95,7 +95,7 @@ func Recover(ctx context.Context, c config.Config, api Client, filename, pageID 
 		}
 		localHash := hash("recovery-pending:" + f.Hash)
 		imageHashes := map[string]string(nil)
-		if len(f.Images) > 0 {
+		if len(f.Images) > 0 && m.Markdown != "" {
 			// For image pages, recovery is an explicit user confirmation that the
 			// created page and its attachments match the local source. Record that
 			// baseline so the next sync does not replace or duplicate image blocks.

@@ -25,7 +25,7 @@ func TestResetAllowsCreatingAtNewDestination(t *testing.T) {
 	if err := Run(context.Background(), c, api, true, func(string, ...any) {}); err != nil {
 		t.Fatal(err)
 	}
-	if api.creates != 2 || api.updates != 0 || api.pages[oldPage] == nil {
+	if api.creates != 2 || api.updates != 2 || api.pages[oldPage] == nil {
 		t.Fatalf("expected new page and preserved old page: creates=%d updates=%d", api.creates, api.updates)
 	}
 }

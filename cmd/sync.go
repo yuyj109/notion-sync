@@ -12,7 +12,7 @@ import (
 
 func addSyncCommands(root *cobra.Command, opts *runtimeOptions) {
 	for _, name := range []string{"diff", "sync"} {
-		var dryRun bool
+		var dryRun, overwrite bool
 		c := &cobra.Command{Use: name + " [source]", Short: map[string]string{"diff": "Show a directory synchronization plan", "sync": "Synchronize a directory to Notion"}[name], Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 			source := ""
 			if len(args) > 0 {
@@ -25,10 +25,11 @@ func addSyncCommands(root *cobra.Command, opts *runtimeOptions) {
 				}
 				return err
 			}
-			return syncer.Run(cmd.Context(), c, notion.Runner{}, name == "sync" && !dryRun, func(format string, args ...any) { _, _ = fmt.Fprintf(cmd.OutOrStdout(), format+"\n", args...) })
+			return syncer.Run(cmd.Context(), c, notion.Runner{}, name == "sync" && !dryRun, func(format string, args ...any) { _, _ = fmt.Fprintf(cmd.OutOrStdout(), format+"\n", args...) }, overwrite)
 		}}
 		if name == "sync" {
 			c.Flags().BoolVar(&dryRun, "dry-run", false, "show changes without writing")
+			c.Flags().BoolVar(&overwrite, "overwrite", false, "overwrite pages changed in Notion with local content")
 		}
 		root.AddCommand(c)
 	}

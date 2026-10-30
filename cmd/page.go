@@ -33,7 +33,7 @@ func addPageCommands(root *cobra.Command, opts *runtimeOptions) {
 	root.AddCommand(page)
 	for _, name := range []string{"sync", "diff"} {
 		var parent, database string
-		var dry bool
+		var dry, overwrite bool
 		c := &cobra.Command{Use: name + " <file>", Args: cobra.ExactArgs(1), Short: "Plan or synchronize one Markdown file", RunE: func(cmd *cobra.Command, args []string) error {
 			var err error
 			if cmd.Root().PersistentFlags().Changed("parent-db-id") && (parent != "" || database != "") {
@@ -82,12 +82,13 @@ func addPageCommands(root *cobra.Command, opts *runtimeOptions) {
 				}
 				return err
 			}
-			return syncer.RunFile(cmd.Context(), cfg, notion.Runner{}, args[0], parent, database, name == "sync" && !dry, func(format string, args ...any) { _, _ = fmt.Fprintf(cmd.OutOrStdout(), format+"\n", args...) })
+			return syncer.RunFile(cmd.Context(), cfg, notion.Runner{}, args[0], parent, database, name == "sync" && !dry, func(format string, args ...any) { _, _ = fmt.Fprintf(cmd.OutOrStdout(), format+"\n", args...) }, overwrite)
 		}}
 		c.Flags().StringVar(&parent, "parent", "", "parent page ID, URL, or unique title")
 		c.Flags().StringVar(&database, "parent-db", "", "parent database ID, URL, or unique title")
 		if name == "sync" {
 			c.Flags().BoolVar(&dry, "dry-run", false, "show changes without writing")
+			c.Flags().BoolVar(&overwrite, "overwrite", false, "overwrite pages changed in Notion with local content")
 		}
 		page.AddCommand(c)
 	}

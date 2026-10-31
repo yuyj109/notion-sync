@@ -13,13 +13,14 @@ import (
 
 const DefaultEnvFile = ".env"
 
-var ErrParentRequired = errors.New("parent page or database ID is required; use --parent-page-id, --parent-db-id, NOTION_SYNC_PARENT_PAGE_ID, or NOTION_SYNC_PARENT_DB_ID")
+var ErrParentRequired = errors.New("parent page or database ID is required; use --parent-id or NOTION_SYNC_PARENT_ID")
 
 const EnvExample = `# Set a parent page ID or database ID for sync and doctor
-NOTION_SYNC_PARENT_PAGE_ID=
-NOTION_SYNC_PARENT_DB_ID=
+NOTION_SYNC_PARENT_ID=
+NOTION_SYNC_PARENT_TYPE=auto
 NOTION_SYNC_SOURCE=./docs
 NOTION_SYNC_PRESERVE_HIERARCHY=true
+NOTION_SYNC_METADATA_FORMAT=frontmatter
 NOTION_SYNC_INCLUDE=**/*.md
 NOTION_SYNC_EXCLUDE=**/node_modules/**
 `
@@ -28,9 +29,10 @@ type Options struct {
 	EnvFile           string
 	EnvFileExplicit   bool
 	Source            *string
-	ParentPageID      *string
-	ParentDatabaseID  *string
+	ParentID          *string
+	ParentType        *string
 	PreserveHierarchy *bool
+	MetadataFormat    *string
 	Include           *[]string
 	Exclude           *[]string
 	FallbackParentID  string
@@ -46,6 +48,8 @@ func Resolve(o Options) (Config, error) {
 	c.WorkDir = cwd
 	c.Source = "./docs"
 	c.Sync.Direction = "push"
+	c.Notion.ParentType = "auto"
+	c.Sync.MetadataFormat = "frontmatter"
 	c.Sync.PreserveHierarchy = true
 	c.Sync.Include = []string{"**/*.md"}
 	c.Sync.Exclude = []string{"**/node_modules/**"}
@@ -87,36 +91,35 @@ func Resolve(o Options) (Config, error) {
 	if v, ok := get("NOTION_SYNC_EXCLUDE"); ok {
 		c.Sync.Exclude = splitList(v)
 	}
+	if v, ok := get("NOTION_SYNC_METADATA_FORMAT"); ok {
+		c.Sync.MetadataFormat = v
+	}
 	if o.Source != nil {
 		c.Source = *o.Source
 	}
-	if o.ParentPageID != nil && o.ParentDatabaseID != nil {
-		return c, fmt.Errorf("--parent-page-id and --parent-db-id are mutually exclusive")
+	if o.ParentID != nil {
+		c.Notion.ParentID = *o.ParentID
+	} else if value, ok := get("NOTION_SYNC_PARENT_ID"); ok && value != "" {
+		c.Notion.ParentID = value
+	} else {
+		c.Notion.ParentID = o.FallbackParentID
 	}
-	switch {
-	case o.ParentPageID != nil:
-		c.Notion.ParentPageID = *o.ParentPageID
-	case o.ParentDatabaseID != nil:
-		c.Notion.ParentDatabaseID = *o.ParentDatabaseID
-	default:
-		page, _ := get("NOTION_SYNC_PARENT_PAGE_ID")
-		db, _ := get("NOTION_SYNC_PARENT_DB_ID")
-		_, pageFromEnv := os.LookupEnv("NOTION_SYNC_PARENT_PAGE_ID")
-		_, dbFromEnv := os.LookupEnv("NOTION_SYNC_PARENT_DB_ID")
-		if page != "" && db != "" {
-			switch {
-			case pageFromEnv && !dbFromEnv:
-				db = ""
-			case dbFromEnv && !pageFromEnv:
-				page = ""
-			default:
-				return c, fmt.Errorf("NOTION_SYNC_PARENT_PAGE_ID and NOTION_SYNC_PARENT_DB_ID are mutually exclusive at the same priority")
-			}
-		}
-		c.Notion.ParentPageID, c.Notion.ParentDatabaseID = page, db
+	if o.ParentType != nil {
+		c.Notion.ParentType = *o.ParentType
+	} else if value, ok := get("NOTION_SYNC_PARENT_TYPE"); ok && value != "" {
+		c.Notion.ParentType = value
+	}
+	if c.Notion.ParentType != "auto" && c.Notion.ParentType != "page" && c.Notion.ParentType != "db" {
+		return c, fmt.Errorf("parent type must be auto, page, or db")
 	}
 	if o.PreserveHierarchy != nil {
 		c.Sync.PreserveHierarchy = *o.PreserveHierarchy
+	}
+	if o.MetadataFormat != nil {
+		c.Sync.MetadataFormat = *o.MetadataFormat
+	}
+	if c.Sync.MetadataFormat != "frontmatter" && c.Sync.MetadataFormat != "comment" {
+		return c, fmt.Errorf("metadata format must be frontmatter or comment")
 	}
 	if o.Include != nil {
 		c.Sync.Include = *o.Include
@@ -124,23 +127,16 @@ func Resolve(o Options) (Config, error) {
 	if o.Exclude != nil {
 		c.Sync.Exclude = *o.Exclude
 	}
-	if c.Notion.ParentPageID == "" && c.Notion.ParentDatabaseID == "" && o.ParentPageID == nil && o.ParentDatabaseID == nil {
-		c.Notion.ParentPageID = o.FallbackParentID
-	}
 	if strings.TrimSpace(c.Source) == "" {
 		return c, fmt.Errorf("source is required")
 	}
-	if c.Notion.ParentPageID == "" && c.Notion.ParentDatabaseID == "" {
+	if c.Notion.ParentID == "" {
 		return c, ErrParentRequired
 	}
-	if c.Notion.ParentDatabaseID != "" && !ValidID(c.Notion.ParentDatabaseID) {
-		return c, fmt.Errorf("invalid parent database ID")
+	if c.Notion.ParentID != "" && !ValidID(c.Notion.ParentID) {
+		return c, fmt.Errorf("invalid parent ID")
 	}
-	c.Notion.ParentDatabaseID = FormatID(c.Notion.ParentDatabaseID)
-	if c.Notion.ParentPageID != "" && !ValidID(c.Notion.ParentPageID) {
-		return c, fmt.Errorf("invalid parent page ID")
-	}
-	c.Notion.ParentPageID = FormatID(c.Notion.ParentPageID)
+	c.Notion.ParentID = FormatID(c.Notion.ParentID)
 	if len(c.Sync.Include) == 0 {
 		return c, fmt.Errorf("include patterns must not be empty")
 	}

@@ -321,7 +321,7 @@ func normalizeMatchedAnchors(body string, urls map[string]string, refs map[strin
 
 // anchorBlockPatch returns an in-place update only when every rich text item can
 // be round-tripped without dropping Notion formatting or unsupported types.
-func anchorBlockPatch(block notionAnchorBlock, urls map[string]string, found map[string]bool, references ...map[string]AnchorRef) ([]any, bool, error) {
+func anchorBlockPatch(block notionAnchorBlock, urls map[string]string, found, used, reserved map[string]bool, references ...map[string]AnchorRef) ([]any, bool, error) {
 	data := block.Data[block.Type]
 	if len(data) == 0 {
 		return nil, false, nil
@@ -370,33 +370,66 @@ func anchorBlockPatch(block notionAnchorBlock, urls map[string]string, found map
 			continue
 		}
 		token := u.Query().Get(anchorQuery)
+		var tokens []string
+		labelText := label.String()
+		matchedLabel := ""
+		count := 1
+		fragment := ""
 		if token != "" {
 			if desired, ok := urls[token]; !ok || !sameAnchorMarker(item.Text.Link.URL, desired) {
 				index = end
 				continue
 			}
-			if ref, ok := refs[token]; ok && ref.Label != label.String() {
-				index = end
-				continue
+			if ref, ok := refs[token]; ok {
+				if ref.Label == "" || labelText == "" || len(labelText)%len(ref.Label) != 0 || strings.Repeat(ref.Label, len(labelText)/len(ref.Label)) != labelText {
+					index = end
+					continue
+				}
+				matchedLabel = ref.Label
+				count = len(labelText) / len(ref.Label)
+				desired, _ := url.Parse(urls[token])
+				fragment = desired.Fragment
 			}
-		} else {
+			if found[token] || used[token] {
+				return nil, false, fmt.Errorf("ambiguous repeated anchor link %q", labelText)
+			}
+			tokens = append(tokens, token)
+		}
+		if token == "" || count > 1 {
+			var candidates []string
+			withoutMarker := *u
+			withoutMarker.RawQuery = ""
 			for candidate, ref := range refs {
-				if ref.Label == label.String() && sameAnchorMarker(item.Text.Link.URL, urls[candidate]) {
-					if token != "" {
-						return nil, false, fmt.Errorf("ambiguous anchor link %q", label.String())
+				if ref.Label != "" && labelText != "" && len(labelText)%len(ref.Label) == 0 && strings.Repeat(ref.Label, len(labelText)/len(ref.Label)) == labelText && sameAnchorMarker(withoutMarker.String(), urls[candidate]) {
+					desired, err := url.Parse(urls[candidate])
+					if err != nil || fragment != "" && fragment != desired.Fragment || matchedLabel != "" && matchedLabel != ref.Label {
+						return nil, false, fmt.Errorf("ambiguous anchor link %q", labelText)
 					}
-					token = candidate
+					fragment = desired.Fragment
+					matchedLabel = ref.Label
+					count = len(labelText) / len(ref.Label)
+					if candidate != token && !found[candidate] && !used[candidate] && !reserved[candidate] {
+						candidates = append(candidates, candidate)
+					}
 				}
 			}
+			if matchedLabel != "" {
+				sort.Strings(candidates)
+				needed := count - len(tokens)
+				if len(candidates) < needed {
+					return nil, false, fmt.Errorf("ambiguous repeated anchor link %q", labelText)
+				}
+				tokens = append(tokens, candidates[:needed]...)
+			}
 		}
-		if token == "" {
+		if len(tokens) == 0 {
 			index = end
 			continue
 		}
-		if found[token] {
-			return nil, false, fmt.Errorf("ambiguous repeated anchor link %q", label.String())
+		for _, matchedToken := range tokens {
+			found[matchedToken] = true
 		}
-		found[token] = true
+		token = tokens[0]
 		for i := index; i < end; i++ {
 			matched[i] = token
 		}
@@ -432,6 +465,38 @@ func anchorBlockPatch(block notionAnchorBlock, urls map[string]string, found map
 		result = append(result, entry)
 	}
 	return result, true, nil
+}
+
+func anchorBlockMarkers(blocks []notionAnchorBlock) (map[string]bool, error) {
+	markers := map[string]bool{}
+	for _, block := range blocks {
+		data := block.Data[block.Type]
+		if len(data) == 0 {
+			continue
+		}
+		var content struct {
+			RichText []struct {
+				Text *struct {
+					Link *struct {
+						URL string `json:"url"`
+					} `json:"link"`
+				} `json:"text"`
+			} `json:"rich_text"`
+		}
+		if err := json.Unmarshal(data, &content); err != nil {
+			return nil, err
+		}
+		for _, item := range content.RichText {
+			if item.Text == nil || item.Text.Link == nil {
+				continue
+			}
+			link, err := url.Parse(item.Text.Link.URL)
+			if err == nil && link.Query().Get(anchorQuery) != "" {
+				markers[link.Query().Get(anchorQuery)] = true
+			}
+		}
+	}
+	return markers, nil
 }
 
 func syncAnchors(ctx context.Context, c config.Config, api Client, s *State, files []File, print func(string, ...any)) error {
@@ -480,7 +545,7 @@ func syncAnchors(ctx context.Context, c config.Config, api Client, s *State, fil
 		}
 		urls := map[string]string{}
 		refs := map[string]AnchorRef{}
-		labels := map[string]bool{}
+		labels := map[string]string{}
 		tokenTargets := map[string]string{}
 		for _, a := range f.Anchors {
 			if a.Token == "" {
@@ -492,10 +557,10 @@ func syncAnchors(ctx context.Context, c config.Config, api Client, s *State, fil
 			}
 			target := s.Entries["file:"+a.Target]
 			key := norm(target.PageID) + "\x00" + a.Label
-			if a.Label == "" || labels[key] {
+			if a.Label == "" || labels[key] != "" && labels[key] != norm(blockID) {
 				return fmt.Errorf("%s: ambiguous anchor label %q for %s; use distinct link labels", f.Path, a.Label, a.Target)
 			}
-			labels[key] = true
+			labels[key] = norm(blockID)
 			urls[a.Token] = anchorPlaceholder(target.PageID, a.Token) + "#" + norm(blockID)
 			refs[a.Token] = a
 			tokenTargets[a.Token] = a.Target
@@ -507,10 +572,14 @@ func syncAnchors(ctx context.Context, c config.Config, api Client, s *State, fil
 		if err != nil {
 			return fmt.Errorf("%s: cannot read anchor blocks: %w", f.Path, err)
 		}
+		reserved, err := anchorBlockMarkers(blocks)
+		if err != nil {
+			return fmt.Errorf("%s: cannot read anchor markers: %w", f.Path, err)
+		}
 		found := map[string]bool{}
 		for _, block := range blocks {
 			inBlock := map[string]bool{}
-			richText, changed, err := anchorBlockPatch(block, urls, inBlock, refs)
+			richText, changed, err := anchorBlockPatch(block, urls, inBlock, found, reserved, refs)
 			if err != nil {
 				return fmt.Errorf("%s: %w", f.Path, err)
 			}
@@ -590,13 +659,23 @@ func syncAnchors(ctx context.Context, c config.Config, api Client, s *State, fil
 			return fmt.Errorf("%s: anchor updated but block verification failed; inspect Notion: %w", patch.path, err)
 		}
 		verified := map[string]bool{}
+		verifiedURLs := map[string]string{}
+		verifiedRefs := map[string]AnchorRef{}
+		for _, token := range patch.tokens {
+			verifiedURLs[token] = patch.urls[token]
+			verifiedRefs[token] = patch.refs[token]
+		}
 		blockFound := false
 		for _, block := range blocks {
 			if norm(block.ID) != norm(patch.block) {
 				continue
 			}
 			blockFound = true
-			_, changed, err := anchorBlockPatch(block, patch.urls, verified, patch.refs)
+			reserved, err := anchorBlockMarkers([]notionAnchorBlock{block})
+			if err != nil {
+				return fmt.Errorf("%s: anchor readback did not match; inspect Notion", patch.path)
+			}
+			_, changed, err := anchorBlockPatch(block, verifiedURLs, verified, nil, reserved, verifiedRefs)
 			if err != nil || changed {
 				return fmt.Errorf("%s: anchor readback did not match; inspect Notion", patch.path)
 			}
@@ -662,7 +741,7 @@ func normalizePullAnchors(ctx context.Context, c config.Config, api Client, s *S
 	urls := map[string]string{}
 	refs := map[string]AnchorRef{}
 	allowed := map[string]bool{}
-	labels := map[string]bool{}
+	labels := map[string]string{}
 	cache := map[string]map[string]string{}
 	for _, ref := range f.Anchors {
 		if ref.Token == "" {
@@ -673,10 +752,6 @@ func normalizePullAnchors(ctx context.Context, c config.Config, api Client, s *S
 			return f, remote, fmt.Errorf("%s: anchor target is not synchronized", ref.Target)
 		}
 		key := norm(e.PageID) + "\x00" + ref.Label
-		if ref.Label == "" || labels[key] {
-			return f, remote, fmt.Errorf("%s: ambiguous anchor label %q for %s", f.Path, ref.Label, ref.Target)
-		}
-		labels[key] = true
 		if _, ok := cache[ref.Target]; !ok {
 			if ref.Target != f.Path {
 				if _, err := validateAnchorTarget(ctx, c, api, s, ref.Target); err != nil {
@@ -698,6 +773,10 @@ func normalizePullAnchors(ctx context.Context, c config.Config, api Client, s *S
 		if !config.ValidID(blockID) {
 			return f, remote, fmt.Errorf("%s: Notion heading %q not found in %s (available anchors: %s)", f.Path, ref.Fragment, ref.Target, headingSlugs(cache[ref.Target]))
 		}
+		if ref.Label == "" || labels[key] != "" && labels[key] != norm(blockID) {
+			return f, remote, fmt.Errorf("%s: ambiguous anchor label %q for %s", f.Path, ref.Label, ref.Target)
+		}
+		labels[key] = norm(blockID)
 		urls[ref.Token] = anchorPlaceholder(e.PageID, ref.Token) + "#" + norm(blockID)
 		refs[ref.Token], allowed[ref.Token] = ref, true
 	}

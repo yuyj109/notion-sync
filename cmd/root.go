@@ -85,6 +85,9 @@ func newRootCommand() *cobra.Command {
 		if user["object"] != "user" {
 			return fmt.Errorf("unexpected user response")
 		}
+		if err := resolveParentID(ctx, &c, r); err != nil {
+			return err
+		}
 		if c.Notion.ParentDatabaseID != "" {
 			if _, _, err = syncer.ResolveDataSource(ctx, r, c.Notion.ParentDatabaseID); err != nil {
 				return fmt.Errorf("parent database: %w", err)

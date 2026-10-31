@@ -39,7 +39,7 @@ notion-sync db query <database-id-or-url> --json
 
 1. Identify the source and destination. Configuration uses flags, environment variables, `.env`, then defaults; per-file frontmatter can specify an existing page or a different parent page/database. Inspect the relevant frontmatter and include/exclude settings to confirm the actual scope.
 2. Run `notion-sync diff <directory>` or `notion-sync page diff <file>`, and use `notion-sync sync <directory> --dry-run` or `notion-sync page sync <file> --dry-run` to inspect the plan. These do not change Notion or local Markdown.
-3. If the user requested the sync and the plan matches the authorized scope, run `notion-sync sync <directory>` or `notion-sync page sync <file>`. Use `--parent-page-id <page-id>` or `--parent-db-id <database-id>` for the default destination, or set `NOTION_SYNC_PARENT_PAGE_ID` or `NOTION_SYNC_PARENT_DB_ID` in the environment or `.env`. A default database receives all files as entries without folder hierarchy; explicit frontmatter destinations take priority. For a single file, `--parent <page-id-or-url>` or `--parent-db <database-id-or-url>` also specifies a destination. Successful sync writes metadata to the file's frontmatter; preserve it.
+3. If the user requested the sync and the plan matches the authorized scope, run `notion-sync sync <directory>` or `notion-sync page sync <file>`. Use `--parent-id <page-or-database-id>` for the default destination, or set `NOTION_SYNC_PARENT_ID` in the environment or `.env`. Optionally specify `--parent-type page` or `--parent-type db`, or set `NOTION_SYNC_PARENT_TYPE`; the default `auto` detects the type. A default database receives all files as entries without folder hierarchy; explicit frontmatter destinations take priority. Successful sync writes metadata to the file's frontmatter; preserve it.
 4. Report the result and any skipped or failed files. For conflicts, inspect the diff and use `--push` only when the user has authorized replacing the conflicting Notion content. Preview with `--push --dry-run`; it applies to every conflicting page in the selected scope. The older `--overwrite` remains an alias. For an explicitly requested Notion → local import, preview `sync <directory> --pull --dry-run` before `--pull`. Pull affects only conflicting files, stops if local content also differs, and currently rejects images, attachments, HTML comments, and changed links or mentions when it cannot safely map them. `page sync` does not support `--pull`. For a changed parent, incomplete retrieval, or uncertain creation, stop rather than retrying blindly. Use `recover` only after verifying whether the page was created; for images also verify the text and image blocks. Consult the README for recovery options.
 
 Conflict diffs compare Notion and local content, not the prior baseline. They omit formatting-only blank lines outside code, `<empty-block/>`, and alternate representations of the same page mention. On a terminal, numbered rows use the original Notion Markdown and local file line numbers, with colored backgrounds; `NO_COLOR` disables colors. Redirected output uses an unnumbered normalized diff. Treat this display as a review aid rather than a complete record of ignored formatting differences.
@@ -50,25 +50,25 @@ Examples (replace IDs and paths with the requested targets):
 
 ```sh
 # Directory to a page; preview before syncing.
-notion-sync sync ./docs --parent-page-id <page-id> --dry-run
-notion-sync sync ./docs --parent-page-id <page-id>
+notion-sync sync ./docs --parent-id <page-id> --parent-type page --dry-run
+notion-sync sync ./docs --parent-id <page-id> --parent-type page
 
 # Directory to a database; subdirectories are flattened.
-notion-sync sync ./docs --parent-db-id <database-id> --dry-run
-notion-sync sync ./docs --parent-db-id <database-id>
+notion-sync sync ./docs --parent-id <database-id> --parent-type db --dry-run
+notion-sync sync ./docs --parent-id <database-id> --parent-type db
 
 # One file to a page.
-notion-sync page sync ./docs/guide.md --parent <page-id-or-url> --dry-run
-notion-sync page sync ./docs/guide.md --parent <page-id-or-url>
+notion-sync page sync ./docs/guide.md --parent-id <page-id> --parent-type page --dry-run
+notion-sync page sync ./docs/guide.md --parent-id <page-id> --parent-type page
 
 # One file to a database.
-notion-sync page sync ./docs/guide.md --parent-db <database-id-or-url> --dry-run
-notion-sync page sync ./docs/guide.md --parent-db <database-id-or-url>
+notion-sync page sync ./docs/guide.md --parent-id <database-id> --parent-type db --dry-run
+notion-sync page sync ./docs/guide.md --parent-id <database-id> --parent-type db
 
 # Explicit conflict resolution, after reviewing the target scope.
-notion-sync sync ./docs --parent-page-id <page-id> --push --dry-run
+notion-sync sync ./docs --parent-id <page-id> --push --dry-run
 notion-sync page sync ./docs/guide.md --push --dry-run
-notion-sync sync ./docs --parent-page-id <page-id> --pull --dry-run
+notion-sync sync ./docs --parent-id <page-id> --pull --dry-run
 ```
 
 `page create --parent <page> --title <title> --content <markdown>` and `db create <database> --title <title> --content <markdown>` create unmanaged pages and do not register them for synchronization. Confirm their content and destination before executing when requested.
@@ -83,12 +83,12 @@ Reset removes the Notion page ID, explicit parent page/database IDs, and recogni
 # Preview and reset a directory, then preview the new database destination.
 notion-sync reset ./docs --dry-run
 notion-sync reset ./docs
-notion-sync sync ./docs --parent-db-id <database-id> --dry-run
+notion-sync sync ./docs --parent-id <database-id> --dry-run
 
 # Preview and reset one file, then preview a new parent page.
 notion-sync reset ./docs/guide.md --dry-run
 notion-sync reset ./docs/guide.md
-notion-sync page sync ./docs/guide.md --parent <page-id-or-url> --dry-run
+notion-sync page sync ./docs/guide.md --parent-id <page-id> --dry-run
 ```
 
 New pages can include local images using standalone Markdown lines, such as `![Diagram](images/diagram.png)`. Images are inserted at their position in the Markdown body. Paths are relative to the Markdown file and must resolve to regular files inside the configured source directory. Current support is limited to PNG, JPEG, GIF, and WebP files up to 20 MB each. Existing synchronized pages automatically replace an image block when its local file hash changes; unchanged images are skipped. Dry-run and completion output report how many images will be updated and how many completed. When Markdown text changes, the page body and its local images are rebuilt in their original order. Removing local images is not supported. Use `--dry-run` to inspect the sync plan before writing. If an upload or attachment has an uncertain outcome, inspect Notion before retrying; do not blindly rerun sync. Beyond the limited explicit pull above, general two-way sync is not supported. The tool does not support comments, general page editing, automatic deletion or archiving, page moves, or general attachments. Do not assume commands from other Notion CLIs exist. Existing page titles are not changed by sync; database entries support the title property only. Concurrent changes between conflict check and update cannot be fully prevented.

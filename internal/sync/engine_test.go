@@ -467,7 +467,7 @@ func TestRunFileConflictProvidesNumberedDiff(t *testing.T) {
 	}
 	api.pages[norm(s.Entries["file:a.md"].PageID)].content = "# A\nremote text\n"
 	noop := func(string, ...any) {}
-	err = RunFile(context.Background(), c, api, filename, "", "", false, noop)
+	err = RunFile(context.Background(), c, api, filename, false, noop)
 	var views interface{ DiffViews() (string, string) }
 	if !errors.As(err, &views) {
 		t.Fatalf("expected conflict with diff views, got %v", err)
@@ -481,7 +481,7 @@ func TestRunFileConflictProvidesNumberedDiff(t *testing.T) {
 		t.Fatalf("missing original line numbers: %s", numbered)
 	}
 	var preview DiffOutput
-	err = RunFile(context.Background(), c, api, filename, "", "", false, func(_ string, args ...any) {
+	err = RunFile(context.Background(), c, api, filename, false, func(_ string, args ...any) {
 		if len(args) == 1 {
 			if d, ok := args[0].(DiffOutput); ok {
 				preview = d
@@ -809,12 +809,12 @@ func TestFrontmatter(t *testing.T) {
 func TestSingleFileDestinationPersists(t *testing.T) {
 	c, api, dir := setup(t)
 	target := filepath.Join(dir, "single.md")
-	write(t, target, "hello")
+	write(t, target, "---\nnotion-parent-page-id: "+rootID+"\n---\nhello")
 	noop := func(string, ...any) {}
-	if err := RunFile(context.Background(), c, api, target, rootID, "", true, noop); err != nil {
+	if err := RunFile(context.Background(), c, api, target, true, noop); err != nil {
 		t.Fatal(err)
 	}
-	if err := RunFile(context.Background(), c, api, target, "", "", true, noop); err != nil {
+	if err := RunFile(context.Background(), c, api, target, true, noop); err != nil {
 		t.Fatal(err)
 	}
 	if err := run(c, api, true); err != nil {
@@ -895,6 +895,86 @@ func TestFrontmatterPreservesMetadataAndBody(t *testing.T) {
 	}
 	if api.creates != 1 || api.updates != 1 {
 		t.Fatal("not idempotent")
+	}
+}
+
+func TestCommentMetadataSync(t *testing.T) {
+	c, api, dir := setup(t)
+	c.Sync.MetadataFormat = "comment"
+	file := filepath.Join(dir, "a.md")
+	write(t, file, "---\ntitle: My title\n---\n# Hello\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	data := string(mustRead(t, file))
+	if !strings.Contains(data, "title: My title") || !strings.Contains(data, "<!-- notion-sync\n") || !strings.Contains(data, "notion-page-id:") {
+		t.Fatalf("missing frontmatter or comment metadata: %s", data)
+	}
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	if api.creates != 1 || api.updates != 1 {
+		t.Fatalf("sync was not idempotent: creates=%d updates=%d", api.creates, api.updates)
+	}
+}
+
+func TestMetadataFormatConversion(t *testing.T) {
+	c, api, dir := setup(t)
+	file := filepath.Join(dir, "a.md")
+	write(t, file, "---\r\ntitle: Keep me\r\n---\r\n# Hello\r\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	c.Sync.MetadataFormat = "comment"
+	if err := run(c, api, false); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(mustRead(t, file)), "<!-- notion-sync") {
+		t.Fatal("dry run changed metadata")
+	}
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	data := string(mustRead(t, file))
+	if !strings.HasPrefix(data, "---\r\ntitle: Keep me\r\n---\r\n<!-- notion-sync\r\n") || !strings.HasSuffix(data, "-->\r\n# Hello\r\n") {
+		t.Fatalf("incorrect comment conversion: %q", data)
+	}
+	if root, err := FileRootID(file); err != nil || norm(root) != norm(rootID) {
+		t.Fatalf("root = %q, err = %v", root, err)
+	}
+	c.Sync.MetadataFormat = "frontmatter"
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	data = string(mustRead(t, file))
+	if strings.Contains(data, "<!-- notion-sync") || !strings.Contains(data, "title: Keep me") || !strings.Contains(data, "notion-page-id:") {
+		t.Fatalf("incorrect frontmatter conversion: %q", data)
+	}
+	if api.creates != 1 || api.updates != 1 {
+		t.Fatalf("conversion wrote to Notion: creates=%d updates=%d", api.creates, api.updates)
+	}
+}
+
+func TestCommentMetadataParsingSafety(t *testing.T) {
+	id := "01234567-89ab-cdef-0123-456789abcdef"
+	for _, input := range []string{
+		"<!-- notion-sync\nnotion-page-id: " + id + "\n",
+		"<!-- notion-sync\ntitle: invalid\n-->\nbody\n",
+		"---\nnotion-page-id: " + id + "\n---\n<!-- notion-sync\nnotion-page-id: " + id + "\n-->\nbody\n",
+	} {
+		if _, err := parse([]byte(input)); err == nil {
+			t.Fatalf("accepted invalid metadata: %q", input)
+		}
+	}
+	input := "<!-- ordinary comment -->\n# Body\n"
+	f, err := parse([]byte(input))
+	if err != nil || f.Body != input || f.Metadata != nil {
+		t.Fatalf("ordinary comment changed: body=%q metadata=%+v err=%v", f.Body, f.Metadata, err)
+	}
+	input = "<!-- notion-sync\r\nnotion-page-id: " + id + "\r\n-->\r\n# Body\r\n"
+	f, err = parse([]byte(input))
+	if err != nil || f.PageID != id || f.Body != "# Body\r\n" {
+		t.Fatalf("comment metadata not parsed: %+v, %v", f, err)
 	}
 }
 func TestMissingDirectoryMetadataStops(t *testing.T) {
@@ -1062,6 +1142,30 @@ func TestRecoverAbsentCreation(t *testing.T) {
 	}
 	if api.creates != 2 {
 		t.Fatalf("expected explicit retry, got %d attempts", api.creates)
+	}
+}
+
+func TestRecoverCommentPendingCreation(t *testing.T) {
+	c, api, dir := setup(t)
+	c.Sync.MetadataFormat = "comment"
+	file := filepath.Join(dir, "recover.md")
+	write(t, file, "# Recover\n")
+	api.failCreate = true
+	if err := run(c, api, true); err == nil {
+		t.Fatal("expected uncertain creation")
+	}
+	if err := Reset(file, false, func(string, ...any) {}); err == nil {
+		t.Fatal("reset accepted pending creation")
+	}
+	if _, err := Recover(context.Background(), c, api, file, "", true); err != nil {
+		t.Fatal(err)
+	}
+	api.failCreate = false
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	if api.creates != 2 || !strings.HasPrefix(string(mustRead(t, file)), "<!-- notion-sync\n") {
+		t.Fatalf("unexpected recovery: creates=%d", api.creates)
 	}
 }
 

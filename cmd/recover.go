@@ -21,6 +21,9 @@ func addRecoverCommand(root *cobra.Command, opts *runtimeOptions) {
 		if err != nil {
 			return err
 		}
+		if err := resolveParentID(cmd.Context(), &cfg, notion.Runner{}); err != nil {
+			return err
+		}
 		if pageID != "" {
 			pageID, err = parseID(pageID)
 			if err != nil {

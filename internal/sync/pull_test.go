@@ -44,6 +44,31 @@ func TestPullOnlyChangesConflictingText(t *testing.T) {
 	}
 }
 
+func TestPullCommentMetadata(t *testing.T) {
+	c, api, dir := setup(t)
+	c.Sync.MetadataFormat = "comment"
+	file := filepath.Join(dir, "a.md")
+	write(t, file, "original\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.pages[norm(s.Entries["file:a.md"].PageID)].content = "updated\n"
+	if err := Pull(context.Background(), c, api, true, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	data := string(mustRead(t, file))
+	if !strings.HasPrefix(data, "<!-- notion-sync\n") || !strings.HasSuffix(data, "-->\nupdated\n") {
+		t.Fatalf("pull result: %q", data)
+	}
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPullRejectsIndependentLocalChanges(t *testing.T) {
 	c, api, dir := setup(t)
 	a := filepath.Join(dir, "a.md")

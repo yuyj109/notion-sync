@@ -354,7 +354,7 @@ func TestSyncNotionHeadingAnchorsAndRefresh(t *testing.T) {
 	check(aID, aID, 0)
 	check(bID, aID, 0)
 	write(t, b, strings.Replace(string(mustRead(t, b)), "### Extra", "### Changed", 1))
-	err = RunFile(context.Background(), c, api, b, "", "", true, func(string, ...any) {})
+	err = RunFile(context.Background(), c, api, b, true, func(string, ...any) {})
 	if err == nil || !strings.Contains(err.Error(), "use directory sync") {
 		t.Fatalf("expected inbound-link protection, got %v", err)
 	}
@@ -393,6 +393,119 @@ func TestNotionStripsAnchorQueryDuringMarkdownImport(t *testing.T) {
 	}
 }
 
+func TestRepeatedIdenticalAnchorLinks(t *testing.T) {
+	c, base, dir := setup(t)
+	api := &testAnchorAPI{fakeAPI: base, blocks: map[string][]testAnchorBlock{}, normalizeLinks: true}
+	a, b := filepath.Join(dir, "a.md"), filepath.Join(dir, "b.md")
+	write(t, a, "# A\n\n[same](./b.md#b)\n\n[same](./b.md#b)\n")
+	write(t, b, "# B\n")
+	if err := Run(context.Background(), c, api, true, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aID, bID := norm(s.Entries["file:a.md"].PageID), norm(s.Entries["file:b.md"].PageID)
+	anchor := "#" + norm(api.blocks[bID][0].id) + ")"
+	if count := strings.Count(api.pages[aID].content, anchor); count != 2 {
+		t.Fatalf("expected two resolved links, got %d: %s", count, api.pages[aID].content)
+	}
+	patches := api.patches
+	if err := RunFile(context.Background(), c, api, a, true, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	if api.patches != patches {
+		t.Fatal("unchanged links were updated")
+	}
+	api.rebuild(bID)
+	if err := Run(context.Background(), c, api, true, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	anchor = "#" + norm(api.blocks[bID][0].id) + ")"
+	if count := strings.Count(api.pages[aID].content, anchor); count != 2 {
+		t.Fatalf("expected two refreshed links, got %d: %s", count, api.pages[aID].content)
+	}
+	api.pages[aID].content += "\nremote edit\n"
+	if err := Pull(context.Background(), c, api, true, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	local := string(mustRead(t, a))
+	if strings.Count(local, "[same](./b.md#b)") != 2 || !strings.Contains(local, "remote edit") {
+		t.Fatalf("pull did not preserve links: %s", local)
+	}
+}
+
+func TestRepeatedIdenticalAnchorLinksInOneBlock(t *testing.T) {
+	for _, normalize := range []bool{false, true} {
+		for _, separator := range []string{" and ", ""} {
+			t.Run(fmt.Sprintf("normalize=%t separator=%q", normalize, separator), func(t *testing.T) {
+				c, base, dir := setup(t)
+				api := &testAnchorAPI{fakeAPI: base, blocks: map[string][]testAnchorBlock{}, normalizeLinks: normalize}
+				write(t, filepath.Join(dir, "a.md"), "# A\n\n[same](./b.md#b)"+separator+"[same](./b.md#b)\n")
+				write(t, filepath.Join(dir, "b.md"), "# B\n")
+				if err := Run(context.Background(), c, api, true, func(string, ...any) {}); err != nil {
+					t.Fatal(err)
+				}
+				s, err := loadState(c)
+				if err != nil {
+					t.Fatal(err)
+				}
+				aID, bID := norm(s.Entries["file:a.md"].PageID), norm(s.Entries["file:b.md"].PageID)
+				anchor := "#" + norm(api.blocks[bID][0].id) + ")"
+				if count := strings.Count(api.pages[aID].content, anchor); count != 2 {
+					t.Fatalf("expected two resolved links, got %d: %s", count, api.pages[aID].content)
+				}
+			})
+		}
+	}
+}
+
+func TestRepeatedAnchorsWithMixedMarkers(t *testing.T) {
+	c, base, dir := setup(t)
+	api := &testAnchorAPI{fakeAPI: base, blocks: map[string][]testAnchorBlock{}}
+	name := ""
+	for index := 0; index < 100; index++ {
+		candidate := fmt.Sprintf("a%d.md", index)
+		identity := candidate + "\x00b.md\x00b\x00"
+		if hash(identity+"0") > hash(identity+"1") {
+			name = candidate
+			break
+		}
+	}
+	if name == "" {
+		t.Fatal("could not find test token ordering")
+	}
+	a := filepath.Join(dir, name)
+	write(t, a, "# A\n\n[same](./b.md#b)\n\n[same](./b.md#b)\n")
+	write(t, filepath.Join(dir, "b.md"), "# B\n")
+	if err := Run(context.Background(), c, api, true, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := []File{*s.Documents[name]}
+	prepareLinks(files, s, c.SourcePath)
+	page := api.pages[norm(s.Entries["file:"+name].PageID)]
+	marker := "?" + anchorQuery + "=" + files[0].Anchors[0].Token
+	if !strings.Contains(page.content, marker) {
+		t.Fatalf("missing marker: %s", page.content)
+	}
+	page.content = strings.Replace(page.content, marker, "", 1)
+	entry := s.Entries["file:"+name]
+	entry.RemoteHash = remoteMarkdownHash(page.content)
+	s.Entries["file:"+name] = entry
+	s.Active[name] = true
+	if err := saveState(c, s); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunFile(context.Background(), c, api, a, true, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAmbiguousAnchorLabelsStopBeforeBlockUpdates(t *testing.T) {
 	c, base, dir := setup(t)
 	api := &testAnchorAPI{fakeAPI: base, blocks: map[string][]testAnchorBlock{}, normalizeLinks: true}
@@ -412,7 +525,7 @@ func TestSingleFileSyncResolvesSelfAnchor(t *testing.T) {
 	api := &testAnchorAPI{fakeAPI: base, blocks: map[string][]testAnchorBlock{}}
 	filename := filepath.Join(dir, "a.md")
 	write(t, filename, "# A\n\n[self](#a)\n")
-	if err := RunFile(context.Background(), c, api, filename, "", "", true, func(string, ...any) {}); err != nil {
+	if err := RunFile(context.Background(), c, api, filename, true, func(string, ...any) {}); err != nil {
 		t.Fatal(err)
 	}
 	s, err := loadState(c)
@@ -478,7 +591,7 @@ func TestSingleFileSyncRejectsUnsynchronizedAnchorTarget(t *testing.T) {
 	write(t, a, strings.Replace(string(mustRead(t, a)), "# A\n", "# A\nExtra\n", 1))
 	write(t, b, strings.Replace(string(mustRead(t, b)), "# B\n", "# B\nChanged\n", 1))
 	updates := api.updates
-	err := RunFile(context.Background(), c, api, a, "", "", true, func(string, ...any) {})
+	err := RunFile(context.Background(), c, api, a, true, func(string, ...any) {})
 	if err == nil || !strings.Contains(err.Error(), "unsynchronized local changes") {
 		t.Fatalf("expected unsynchronized target error, got %v", err)
 	}
@@ -499,7 +612,7 @@ func TestSingleFileSyncProtectsPreviouslySyncedLinksRemovedLocally(t *testing.T)
 	write(t, a, strings.Replace(string(mustRead(t, a)), "[link](./b.md#b)\n", "", 1))
 	write(t, b, strings.Replace(string(mustRead(t, b)), "# B\n", "# B\nChanged\n", 1))
 	before := api.updates
-	err := RunFile(context.Background(), c, api, b, "", "", true, func(string, ...any) {})
+	err := RunFile(context.Background(), c, api, b, true, func(string, ...any) {})
 	if err == nil || !strings.Contains(err.Error(), "still links") {
 		t.Fatalf("expected remote inbound-link protection, got %v", err)
 	}
@@ -519,7 +632,7 @@ func TestSingleFileCreateRejectsInboundHeadingReferences(t *testing.T) {
 	a := filepath.Join(dir, "a.md")
 	write(t, a, "# A\n")
 	before := api.creates
-	err := RunFile(context.Background(), c, api, a, "", "", true, func(string, ...any) {})
+	err := RunFile(context.Background(), c, api, a, true, func(string, ...any) {})
 	if err == nil || !strings.Contains(err.Error(), "use directory sync") {
 		t.Fatalf("expected inbound-link protection, got %v", err)
 	}
@@ -753,6 +866,31 @@ func TestPullDoesNotHideChangedHeadingTarget(t *testing.T) {
 	}
 }
 
+func TestPullDoesNotHideChangedRepeatedHeadingTarget(t *testing.T) {
+	c, base, dir := setup(t)
+	api := &testAnchorAPI{fakeAPI: base, blocks: map[string][]testAnchorBlock{}, normalizeLinks: true}
+	a := filepath.Join(dir, "a.md")
+	write(t, a, "# A\n\n[same](./b.md#b)\n\n[same](./b.md#b)\n")
+	write(t, filepath.Join(dir, "b.md"), "# B\n\n## Other\n")
+	if err := Run(context.Background(), c, api, true, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aID, bID := norm(s.Entries["file:a.md"].PageID), norm(s.Entries["file:b.md"].PageID)
+	page := api.pages[aID]
+	page.content = strings.Replace(page.content, "#"+norm(api.blocks[bID][0].id), "#"+norm(api.blocks[bID][1].id), 1)
+	before := string(mustRead(t, a))
+	if err := Pull(context.Background(), c, api, true, func(string, ...any) {}); err == nil || !strings.Contains(err.Error(), "changed line containing a link") {
+		t.Fatalf("expected changed link conflict, got %v", err)
+	}
+	if string(mustRead(t, a)) != before {
+		t.Fatal("pull overwrote local links")
+	}
+}
+
 func TestAnchorURLMatchesNotionCanonicalForms(t *testing.T) {
 	page := "11111111-1111-1111-1111-111111111111"
 	block := "22222222222222222222222222222222"
@@ -782,7 +920,7 @@ func TestAnchorBlockPatchRejectsUnsupportedRichText(t *testing.T) {
 		t.Fatal(err)
 	}
 	block := notionAnchorBlock{Type: "paragraph", Data: map[string]json.RawMessage{"paragraph": raw}}
-	_, _, err = anchorBlockPatch(block, map[string]string{token: placeholder + "#22222222222222222222222222222222"}, map[string]bool{})
+	_, _, err = anchorBlockPatch(block, map[string]string{token: placeholder + "#22222222222222222222222222222222"}, map[string]bool{}, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "non-text") {
 		t.Fatalf("expected safe refusal, got %v", err)
 	}
@@ -801,7 +939,7 @@ func TestAnchorBlockPatchMatchesNotionNormalizedPageURL(t *testing.T) {
 	}
 	block := notionAnchorBlock{Type: "paragraph", Data: map[string]json.RawMessage{"paragraph": raw}}
 	found := map[string]bool{}
-	items, changed, err := anchorBlockPatch(block, map[string]string{token: desired}, found, map[string]AnchorRef{token: {Token: token, Label: "案内へ戻る"}})
+	items, changed, err := anchorBlockPatch(block, map[string]string{token: desired}, found, nil, nil, map[string]AnchorRef{token: {Token: token, Label: "案内へ戻る"}})
 	if err != nil || !changed || !found[token] {
 		t.Fatalf("changed=%v found=%v err=%v", changed, found, err)
 	}
@@ -824,7 +962,7 @@ func TestAnchorBlockPatchPreservesSplitLinkFormatting(t *testing.T) {
 		t.Fatal(err)
 	}
 	block := notionAnchorBlock{Type: "paragraph", Data: map[string]json.RawMessage{"paragraph": raw}}
-	items, changed, err := anchorBlockPatch(block, map[string]string{token: desired}, map[string]bool{}, map[string]AnchorRef{token: {Label: "bold plain"}})
+	items, changed, err := anchorBlockPatch(block, map[string]string{token: desired}, map[string]bool{}, nil, nil, map[string]AnchorRef{token: {Label: "bold plain"}})
 	if err != nil || !changed || len(items) != 2 {
 		t.Fatalf("changed=%v items=%v err=%v", changed, items, err)
 	}

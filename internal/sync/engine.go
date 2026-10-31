@@ -355,7 +355,11 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 				} else {
 					a.Kind = "unchanged"
 				}
-				if f.RootNeedsFormatting {
+				format := c.Sync.MetadataFormat
+				if format == "" {
+					format = "frontmatter"
+				}
+				if f.RootNeedsFormatting || f.Metadata != nil && f.MetadataFormat != format {
 					if a.Kind == "unchanged" {
 						a.Kind = "normalize"
 					}
@@ -889,10 +893,7 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 }
 
 // RunFile limits synchronization to one scanned file; other state entries are retained.
-func RunFile(ctx context.Context, c config.Config, api Client, filename, parentID, databaseID string, apply bool, print func(string, ...any), overwrite ...bool) error {
-	if parentID != "" && databaseID != "" {
-		return fmt.Errorf("--parent and --parent-db are mutually exclusive")
-	}
+func RunFile(ctx context.Context, c config.Config, api Client, filename string, apply bool, print func(string, ...any), overwrite ...bool) error {
 	var unlock func()
 	if apply {
 		var err error
@@ -961,12 +962,6 @@ func RunFile(ctx context.Context, c config.Config, api Client, filename, parentI
 	selected[0] = *stored
 	s.Active[rel] = true
 	prepareLinks(selected, s, c.SourcePath)
-	if parentID != "" || databaseID != "" {
-		if selected[0].ParentID != "" || selected[0].DatabaseID != "" || selected[0].PageID != "" && selected[0].Metadata == nil {
-			return fmt.Errorf("destination flags cannot be combined with explicit frontmatter destination")
-		}
-		selected[0].ParentID, selected[0].DatabaseID = parentID, databaseID
-	}
 	p, err := Build(ctx, c, api, selected, s, overwrite...)
 	if err != nil {
 		return err
@@ -1033,9 +1028,6 @@ func RunFile(ctx context.Context, c config.Config, api Client, filename, parentI
 			return err
 		}
 		selected[0] = *s.Documents[rel]
-		if parentID != "" || databaseID != "" {
-			selected[0].ParentID, selected[0].DatabaseID = parentID, databaseID
-		}
 		prepareLinks(selected, s, c.SourcePath)
 		p, err = Build(ctx, c, api, selected, s, overwrite...)
 		if err != nil {

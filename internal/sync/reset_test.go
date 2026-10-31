@@ -58,6 +58,22 @@ func TestResetFilePreservesOtherContent(t *testing.T) {
 	}
 }
 
+func TestResetCommentMetadata(t *testing.T) {
+	c, api, dir := setup(t)
+	c.Sync.MetadataFormat = "comment"
+	file := filepath.Join(dir, "note.md")
+	write(t, file, "---\ntitle: Keep me\n---\n# Body\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := Reset(file, false, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(mustRead(t, file)); got != "---\ntitle: Keep me\n---\n# Body\n" {
+		t.Fatalf("reset result: %q", got)
+	}
+}
+
 func TestResetDirectoryStopsBeforeAnyWriteOnPending(t *testing.T) {
 	dir := t.TempDir()
 	first := filepath.Join(dir, "a.md")

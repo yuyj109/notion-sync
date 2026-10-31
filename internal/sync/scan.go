@@ -29,6 +29,7 @@ type File struct {
 	Images                                         []Image
 	Anchors                                        []AnchorRef
 	Metadata                                       *Metadata
+	MetadataFormat                                 string
 	RootNeedsFormatting                            bool
 }
 
@@ -387,7 +388,7 @@ func pageTitle(body, filename string) string {
 	return strings.TrimSuffix(path.Base(filename), path.Ext(filename))
 }
 
-func frontmatter(data []byte) (*yaml.Node, string, string, error) {
+func yamlFrontmatter(data []byte) (*yaml.Node, string, string, error) {
 	text := string(data)
 	nl := "\n"
 	if strings.HasPrefix(text, "---\r\n") {
@@ -426,8 +427,60 @@ func frontmatter(data []byte) (*yaml.Node, string, string, error) {
 	}
 	return &root, body, nl, nil
 }
+
+func isNotionKey(key string) bool {
+	return key == "notion-page-id" || key == "notion-parent-page-id" || key == "notion-database-id" || isFlatKey(key)
+}
+
+func frontmatter(data []byte) (*yaml.Node, string, string, error) {
+	root, body, nl, err := yamlFrontmatter(data)
+	if err != nil {
+		return nil, "", "", err
+	}
+	commentNL := "\n"
+	if strings.HasPrefix(body, "<!-- notion-sync\r\n") {
+		commentNL = "\r\n"
+		if !strings.HasPrefix(string(data), "---\n") {
+			nl = commentNL
+		}
+	} else if !strings.HasPrefix(body, "<!-- notion-sync\n") {
+		return root, body, nl, nil
+	}
+	prefix := "<!-- notion-sync" + commentNL
+	rest := body[len(prefix):]
+	at := strings.Index(rest, commentNL+"-->")
+	if at < 0 {
+		return nil, "", "", fmt.Errorf("unclosed notion-sync comment")
+	}
+	meta := rest[:at]
+	body = rest[at+len(commentNL+"-->"):]
+	if strings.HasPrefix(body, commentNL) {
+		body = body[len(commentNL):]
+	} else if body != "" {
+		return nil, "", "", fmt.Errorf("invalid notion-sync comment closing line")
+	}
+	comment, _, _, err := yamlFrontmatter([]byte("---" + commentNL + meta + commentNL + "---" + commentNL))
+	if err != nil {
+		return nil, "", "", fmt.Errorf("invalid notion-sync comment: %w", err)
+	}
+	for i := 0; i < len(comment.Content[0].Content); i += 2 {
+		if !isNotionKey(comment.Content[0].Content[i].Value) {
+			return nil, "", "", fmt.Errorf("invalid notion-sync comment key %q", comment.Content[0].Content[i].Value)
+		}
+	}
+	root.Content[0].Content = append(root.Content[0].Content, comment.Content[0].Content...)
+	return root, body, nl, nil
+}
 func parse(data []byte) (File, error) {
 	f := File{Raw: append([]byte(nil), data...)}
+	_, originalBody, _, err := yamlFrontmatter(data)
+	if err != nil {
+		return f, err
+	}
+	f.MetadataFormat = "frontmatter"
+	if strings.HasPrefix(originalBody, "<!-- notion-sync\n") || strings.HasPrefix(originalBody, "<!-- notion-sync\r\n") {
+		f.MetadataFormat = "comment"
+	}
 	root, body, _, err := frontmatter(data)
 	if err != nil {
 		return f, err

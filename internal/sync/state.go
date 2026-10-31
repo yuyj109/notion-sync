@@ -142,7 +142,11 @@ func saveState(c config.Config, s State) error {
 		if m.Entry == nil && len(m.Directories) == 0 && m.Pending == nil && f.Metadata == nil {
 			continue
 		}
-		if reflect.DeepEqual(f.Metadata, &m) {
+		format := c.Sync.MetadataFormat
+		if format == "" {
+			format = "frontmatter"
+		}
+		if reflect.DeepEqual(f.Metadata, &m) && f.MetadataFormat == format {
 			continue
 		}
 		if err := writeMetadata(c, f, &m); err != nil {
@@ -193,20 +197,14 @@ func writeMetadataBody(c config.Config, f *File, m *Metadata, replacement *strin
 	if err := writeFlat(mapping, m); err != nil {
 		return err
 	}
-	var buf bytes.Buffer
-	enc := yaml.NewEncoder(&buf)
-	enc.SetIndent(2)
-	if err := enc.Encode(root); err != nil {
+	format := c.Sync.MetadataFormat
+	if format == "" {
+		format = "frontmatter"
+	}
+	result, err := renderMetadata(root, body, nl, format, current)
+	if err != nil {
 		return err
 	}
-	if err := enc.Close(); err != nil {
-		return err
-	}
-	header := strings.TrimSuffix(buf.String(), "\n")
-	if nl == "\r\n" {
-		header = strings.ReplaceAll(header, "\n", nl)
-	}
-	result := []byte("---" + nl + header + nl + "---" + nl + body)
 	if bytes.Equal(result, current) {
 		f.Metadata = m
 		return nil
@@ -235,11 +233,73 @@ func writeMetadataBody(c config.Config, f *File, m *Metadata, replacement *strin
 	}
 	f.Raw = result
 	f.Metadata = m
+	f.MetadataFormat = format
 	f.RootNeedsFormatting = false
 	if m.Entry != nil {
 		f.PageID = m.Entry.PageID
 	}
 	return nil
+}
+
+func renderMetadata(root *yaml.Node, body, nl, format string, original []byte) ([]byte, error) {
+	encode := func(node *yaml.Node) (string, error) {
+		var buf bytes.Buffer
+		enc := yaml.NewEncoder(&buf)
+		enc.SetIndent(2)
+		if err := enc.Encode(node); err != nil {
+			return "", err
+		}
+		if err := enc.Close(); err != nil {
+			return "", err
+		}
+		return strings.ReplaceAll(strings.TrimSuffix(buf.String(), "\n"), "\n", nl), nil
+	}
+	if format == "frontmatter" {
+		header, err := encode(root)
+		if err != nil {
+			return nil, err
+		}
+		return []byte("---" + nl + header + nl + "---" + nl + body), nil
+	}
+	if format != "comment" {
+		return nil, fmt.Errorf("invalid metadata format %q", format)
+	}
+	mapping := root.Content[0]
+	var ordinary, notion []*yaml.Node
+	for i := 0; i < len(mapping.Content); i += 2 {
+		if isNotionKey(mapping.Content[i].Value) {
+			notion = append(notion, mapping.Content[i], mapping.Content[i+1])
+		} else {
+			ordinary = append(ordinary, mapping.Content[i], mapping.Content[i+1])
+		}
+	}
+	originalRoot, originalBody, _, err := yamlFrontmatter(original)
+	if err != nil {
+		return nil, err
+	}
+	prefix := ""
+	if len(originalRoot.Content[0].Content) == len(ordinary) {
+		prefix = string(original[:len(original)-len(originalBody)])
+		if prefix != "" && !strings.HasSuffix(prefix, "\n") {
+			prefix += nl
+		}
+	} else if len(ordinary) > 0 {
+		mapping.Content = ordinary
+		header, err := encode(root)
+		if err != nil {
+			return nil, err
+		}
+		prefix = "---" + nl + header + nl + "---" + nl
+	}
+	mapping.Content = notion
+	header, err := encode(root)
+	if err != nil {
+		return nil, err
+	}
+	if strings.Contains(header, "-->") {
+		return nil, fmt.Errorf("metadata cannot contain --> in comment format")
+	}
+	return []byte(prefix + "<!-- notion-sync" + nl + header + nl + "-->" + nl + body), nil
 }
 func lock(c config.Config) (func(), error) {
 	workDir, err := filepath.Abs(c.WorkDir)

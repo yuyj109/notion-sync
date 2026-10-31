@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -32,62 +31,23 @@ func addPageCommands(root *cobra.Command, opts *runtimeOptions) {
 	page := &cobra.Command{Use: "page", Short: "Work with Notion pages"}
 	root.AddCommand(page)
 	for _, name := range []string{"sync", "diff"} {
-		var parent, database string
 		var dry, push, overwrite bool
 		c := &cobra.Command{Use: name + " <file>", Args: cobra.ExactArgs(1), Short: "Plan or synchronize one Markdown file", RunE: func(cmd *cobra.Command, args []string) error {
-			var err error
-			if cmd.Root().PersistentFlags().Changed("parent-db-id") && (parent != "" || database != "") {
-				return fmt.Errorf("--parent-db-id cannot be combined with --parent or --parent-db")
-			}
-			if parent != "" {
-				parent, err = resolveID(cmd.Context(), parent, "page")
-				if err != nil {
-					return err
-				}
-			}
-			if database != "" {
-				database, err = resolveID(cmd.Context(), database, "data_source")
-				if err != nil {
-					return err
-				}
-			}
 			fallback, err := syncer.FileRootID(args[0])
 			if err != nil {
 				return err
 			}
-			if fallback == "" {
-				fallback = parent
-			}
 			cfg, err := opts.resolve(cmd, "", fallback, filepath.Dir(args[0]))
-			if errors.Is(err, config.ErrParentRequired) && database != "" {
-				var db struct {
-					Object string `json:"object"`
-					ID     string `json:"id"`
-					Parent struct {
-						Type   string `json:"type"`
-						PageID string `json:"page_id"`
-					} `json:"parent"`
-				}
-				if err := (notion.Runner{}).API(cmd.Context(), "GET", "v1/databases/"+database, nil, &db); err != nil {
-					return err
-				}
-				if db.Object != "database" || config.NormalizeID(db.ID) != config.NormalizeID(database) || db.Parent.Type != "page_id" || !config.ValidID(db.Parent.PageID) {
-					return fmt.Errorf("database parent is not a page; specify --parent-page-id")
-				}
-				cfg, err = opts.resolve(cmd, "", db.Parent.PageID, filepath.Dir(args[0]))
-			}
 			if err != nil {
-				if errors.Is(err, config.ErrParentRequired) && database == "" {
-					return fmt.Errorf("%w; for a single file, use --parent <page> or --parent-db <database>", err)
-				}
+				return err
+			}
+			if err := resolveParentID(cmd.Context(), &cfg, notion.Runner{}); err != nil {
 				return err
 			}
 			return withLockRecovery(cmd, func() error {
-				return syncer.RunFile(cmd.Context(), cfg, notion.Runner{}, args[0], parent, database, name == "sync" && !dry, func(format string, args ...any) { printSync(cmd.OutOrStdout(), format, args...) }, push || overwrite)
+				return syncer.RunFile(cmd.Context(), cfg, notion.Runner{}, args[0], name == "sync" && !dry, func(format string, args ...any) { printSync(cmd.OutOrStdout(), format, args...) }, push || overwrite)
 			})
 		}}
-		c.Flags().StringVar(&parent, "parent", "", "parent page ID, URL, or unique title")
-		c.Flags().StringVar(&database, "parent-db", "", "parent database ID, URL, or unique title")
 		if name == "sync" {
 			c.Flags().BoolVar(&dry, "dry-run", false, "show changes without writing")
 			c.Flags().BoolVar(&push, "push", false, "overwrite pages changed in Notion with local content")

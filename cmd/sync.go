@@ -24,8 +24,11 @@ func addSyncCommands(root *cobra.Command, opts *runtimeOptions) {
 			c, err := opts.resolve(cmd, source, "", "")
 			if err != nil {
 				if errors.Is(err, config.ErrParentRequired) {
-					return fmt.Errorf("%w\ndirectory sync requires a default parent page or database even when files specify notion-database-id; for a single file use page %s --parent-db <database>", err, name)
+					return fmt.Errorf("%w\ndirectory sync requires a default parent page or database even when files specify notion-database-id", err)
 				}
+				return err
+			}
+			if err := resolveParentID(cmd.Context(), &c, notion.Runner{}); err != nil {
 				return err
 			}
 			return withLockRecovery(cmd, func() error {

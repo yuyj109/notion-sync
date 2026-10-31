@@ -7,9 +7,10 @@ import (
 
 type Config struct {
 	Source string
-	Notion struct{ ParentPageID, ParentDatabaseID string }
+	Notion struct{ ParentID, ParentType, ParentPageID, ParentDatabaseID string }
 	Sync   struct {
 		Direction         string
+		MetadataFormat    string
 		PreserveHierarchy bool
 		Delete            bool
 		Include           []string

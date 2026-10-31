@@ -163,6 +163,10 @@ func verifyFileUnchanged(c config.Config, f *File) error {
 	return nil
 }
 func writeMetadata(c config.Config, f *File, m *Metadata) error {
+	return writeMetadataBody(c, f, m, nil)
+}
+
+func writeMetadataBody(c config.Config, f *File, m *Metadata, replacement *string) error {
 	filename := filepath.Join(c.SourcePath, filepath.FromSlash(f.Path))
 	info, err := os.Lstat(filename)
 	if err != nil {
@@ -181,6 +185,9 @@ func writeMetadata(c config.Config, f *File, m *Metadata) error {
 	root, body, nl, err := frontmatter(current)
 	if err != nil {
 		return err
+	}
+	if replacement != nil {
+		body = *replacement
 	}
 	mapping := root.Content[0]
 	if err := writeFlat(mapping, m); err != nil {
@@ -247,6 +254,9 @@ func lock(c config.Config) (func(), error) {
 	name := filepath.Join(os.TempDir(), fmt.Sprintf("notion-sync-%x.lock", digest))
 	f, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
+		if os.IsExist(err) {
+			return nil, &LockExistsError{Path: name}
+		}
 		return nil, fmt.Errorf("cannot acquire sync lock %s: %w", name, err)
 	}
 	if _, err := fmt.Fprintln(f, os.Getpid()); err != nil {

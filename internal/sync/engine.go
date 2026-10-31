@@ -49,6 +49,8 @@ type Action struct {
 	Body                                                                              string
 	TextParts                                                                         []string
 	Overwrite                                                                         bool
+	ConflictDiff                                                                      string
+	ConflictDiffNumbered                                                              string
 }
 type Plan struct {
 	Actions []Action
@@ -130,10 +132,16 @@ func ResolveDataSource(ctx context.Context, api Client, id string) (string, stri
 	return ds, title, nil
 }
 
-type remoteChangedError struct{ pageID string }
+type remoteChangedError struct{ pageID, diff, numberedDiff string }
+
+func (e *remoteChangedError) DiffViews() (string, string) { return e.diff, e.numberedDiff }
 
 func (e *remoteChangedError) Error() string {
-	return fmt.Sprintf("page %s has changed in Notion; review it and use sync --overwrite to replace it with local content", e.pageID)
+	msg := fmt.Sprintf("page %s has changed in Notion; review it and use --push to replace it with local content", e.pageID)
+	if e.diff != "" {
+		msg += "\n" + e.diff
+	}
+	return msg
 }
 
 func validateExisting(ctx context.Context, api Client, e Entry) (markdown, error) {
@@ -324,11 +332,18 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 			conflict := false
 			if err != nil {
 				var changed *remoteChangedError
-				if !errors.As(err, &changed) || len(overwrite) == 0 || !overwrite[0] {
+				if !errors.As(err, &changed) {
+					return plan, fmt.Errorf("%s: %w", f.Path, err)
+				}
+				diff := makeContentDiff(f.Path, m.Markdown, f.SyncBody, 0, sourceBodyOffset(f))
+				changed.diff, changed.numberedDiff = diff.Plain, diff.Numbered
+				if len(overwrite) == 0 || !overwrite[0] {
 					return plan, fmt.Errorf("%s: %w", f.Path, err)
 				}
 				conflict = true
 				a.Overwrite = true
+				a.ConflictDiff = changed.diff
+				a.ConflictDiffNumbered = changed.numberedDiff
 				e.RemoteHash = remoteMarkdownHash(m.Markdown)
 				a.Entry = e
 			}
@@ -575,6 +590,9 @@ func printPlan(p Plan, print func(string, ...any)) {
 			}
 			if a.Overwrite {
 				print("overwrite %s -> %s (Notion content changed)", a.Path, destination)
+				if a.ConflictDiff != "" {
+					print("%s", DiffOutput{Plain: a.ConflictDiff, Numbered: a.ConflictDiffNumbered})
+				}
 			} else if a.Kind == "images-update" {
 				images := changedImages(a.File.Images, a.Entry.ImageHashes)
 				print("update images (%d) %s -> %s", len(images), a.Path, destination)
@@ -807,7 +825,7 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 			s.Active[stored.Path] = true
 		}
 	}
-	prepareLinks(files, s)
+	prepareLinks(files, s, c.SourcePath)
 	p, err := Build(ctx, c, api, files, s, overwrite...)
 	if err != nil {
 		return err
@@ -839,7 +857,7 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 		for i := range files {
 			files[i] = *s.Documents[files[i].Path]
 		}
-		prepareLinks(files, s)
+		prepareLinks(files, s, c.SourcePath)
 		p, err = Build(ctx, c, api, files, s, overwrite...)
 		if err != nil {
 			return err
@@ -920,7 +938,7 @@ func RunFile(ctx context.Context, c config.Config, api Client, filename, parentI
 	}
 	selected[0] = *stored
 	s.Active[rel] = true
-	prepareLinks(selected, s)
+	prepareLinks(selected, s, c.SourcePath)
 	if parentID != "" || databaseID != "" {
 		if selected[0].ParentID != "" || selected[0].DatabaseID != "" || selected[0].PageID != "" && selected[0].Metadata == nil {
 			return fmt.Errorf("destination flags cannot be combined with explicit frontmatter destination")

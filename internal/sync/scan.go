@@ -104,7 +104,11 @@ func escapedAt(body string, i int) bool {
 
 // remoteMarkdownHash ignores expiring query signatures in Notion-hosted image URLs.
 func remoteMarkdownHash(body string) string {
-	canonical := remoteImageRE.ReplaceAllStringFunc(body, func(value string) string {
+	return hash(canonicalRemoteMarkdown(body))
+}
+
+func canonicalRemoteMarkdown(body string) string {
+	return remoteImageRE.ReplaceAllStringFunc(body, func(value string) string {
 		parts := remoteImageRE.FindStringSubmatch(value)
 		if len(parts) < 3 {
 			return value
@@ -118,7 +122,6 @@ func remoteMarkdownHash(body string) string {
 		parsed.ForceQuery = false
 		return "![" + parts[1] + "](<" + parsed.String() + ">)" + parts[3]
 	})
-	return hash(canonical)
 }
 
 // localImages resolves standalone Markdown image lines beneath the source root.

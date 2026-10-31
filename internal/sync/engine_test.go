@@ -25,6 +25,7 @@ type fakeAPI struct {
 	failMarkdown     bool
 	failUpdate       bool
 	onUpdate         func()
+	onMarkdownGet    func()
 	titles           []string
 	imageBlocks      []map[string]any
 	events           []string
@@ -112,6 +113,9 @@ func (f *fakeAPI) API(_ context.Context, method, endpoint string, body any, out 
 	}
 	if isMarkdown && method == "GET" && f.failMarkdown {
 		return errors.New("readback failed")
+	}
+	if isMarkdown && method == "GET" && f.onMarkdownGet != nil {
+		f.onMarkdownGet()
 	}
 	return copyResult(map[string]any{"object": "page_markdown", "id": id, "markdown": p.content, "truncated": false, "unknown_block_ids": []string{}})
 }
@@ -398,12 +402,16 @@ func TestOverwriteRemoteChanges(t *testing.T) {
 	}
 	id := s.Entries["file:a.md"].PageID
 	api.pages[norm(id)].content = "edited in Notion"
-	if err := run(c, api, true); err == nil {
-		t.Fatal("expected conflict")
+	if err := run(c, api, true); err == nil || !strings.Contains(err.Error(), "-edited in Notion") || !strings.Contains(err.Error(), "+local") {
+		t.Fatalf("expected conflict with diff, got %v", err)
 	}
 	before := api.updates
-	if err := Run(context.Background(), c, api, false, func(string, ...any) {}, true); err != nil {
+	var output strings.Builder
+	if err := Run(context.Background(), c, api, false, func(format string, args ...any) { fmt.Fprintf(&output, format+"\n", args...) }, true); err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "-edited in Notion") || !strings.Contains(output.String(), "+local") {
+		t.Fatalf("missing preview diff: %s", output.String())
 	}
 	if api.updates != before {
 		t.Fatal("dry run wrote to Notion")
@@ -443,6 +451,48 @@ func TestOverwriteRejectsChangesAfterPlanning(t *testing.T) {
 	}
 	if api.pages[norm(id)].content != "second edit" {
 		t.Fatal("later edit was overwritten")
+	}
+}
+
+func TestRunFileConflictProvidesNumberedDiff(t *testing.T) {
+	c, api, dir := setup(t)
+	filename := filepath.Join(dir, "a.md")
+	write(t, filename, "# A\n\nlocal text\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.pages[norm(s.Entries["file:a.md"].PageID)].content = "# A\nremote text\n"
+	noop := func(string, ...any) {}
+	err = RunFile(context.Background(), c, api, filename, "", "", false, noop)
+	var views interface{ DiffViews() (string, string) }
+	if !errors.As(err, &views) {
+		t.Fatalf("expected conflict with diff views, got %v", err)
+	}
+	plain, numbered := views.DiffViews()
+	if !strings.Contains(plain, "-remote text") || !strings.Contains(plain, "+local text") {
+		t.Fatalf("missing diff: %s", plain)
+	}
+	line := sourceBodyOffset(*s.Documents["a.md"]) + 3
+	if !strings.Contains(numbered, fmt.Sprintf("%4d │ local text", line)) || !strings.Contains(numbered, "   2      │ remote text") {
+		t.Fatalf("missing original line numbers: %s", numbered)
+	}
+	var preview DiffOutput
+	err = RunFile(context.Background(), c, api, filename, "", "", false, func(_ string, args ...any) {
+		if len(args) == 1 {
+			if d, ok := args[0].(DiffOutput); ok {
+				preview = d
+			}
+		}
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.Plain != plain || preview.Numbered != numbered {
+		t.Fatal("push preview differs from conflict diff")
 	}
 }
 

@@ -16,6 +16,31 @@ import (
 
 var diffMention = regexp.MustCompile(`<mention-page\s+url="([^"]+)"\s*(?:/>|>[^<]*</mention-page>)`)
 var diffPageID = regexp.MustCompile(`(?i)([0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`)
+var diffNotionURL = regexp.MustCompile(`https://(?:www\.|app\.)?notion\.(?:so|com)/[^\s<>)]+`)
+var diffEnclosedAnchor = regexp.MustCompile(`\(<(https://notion\.so/[0-9a-f-]+\?notion-sync-anchor=[0-9a-f]{64})>(\s+"[^"]*")?\)`)
+
+func normalizeAnchorURLs(body string, permitted map[string]bool) string {
+	body = diffNotionURL.ReplaceAllStringFunc(body, func(value string) string {
+		u, err := url.Parse(value)
+		if err != nil {
+			return value
+		}
+		token := u.Query().Get(anchorQuery)
+		pageID := diffPageID.FindString(u.Path)
+		if len(token) != 64 || !config.ValidID(pageID) || permitted != nil && !permitted[token] {
+			return value
+		}
+		return anchorPlaceholder(pageID, token)
+	})
+	return diffEnclosedAnchor.ReplaceAllStringFunc(body, func(value string) string {
+		parts := diffEnclosedAnchor.FindStringSubmatch(value)
+		u, err := url.Parse(parts[1])
+		if err != nil || permitted != nil && !permitted[u.Query().Get(anchorQuery)] {
+			return value
+		}
+		return "(" + parts[1] + parts[2] + ")"
+	})
+}
 
 type diffLine struct {
 	text, key string
@@ -75,6 +100,7 @@ func diffLines(body string) []diffLine {
 		}
 		key := raw
 		if !isCode {
+			key = normalizeAnchorURLs(key, nil)
 			key = diffMention.ReplaceAllStringFunc(key, func(mention string) string {
 				parts := diffMention.FindStringSubmatch(mention)
 				u, err := url.Parse(parts[1])

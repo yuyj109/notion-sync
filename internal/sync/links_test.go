@@ -31,7 +31,10 @@ func TestExternalLocalLinksUseCommittedGitHubFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "src", "a b.go"), []byte("package a\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	runGit("add", "src/a b.go")
+	if err := os.WriteFile(filepath.Join(dir, "src", "guide.md"), []byte("# Guide\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "src/a b.go", "src/guide.md")
 	runGit("-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-qm", "initial")
 	commit := runGit("rev-parse", "HEAD")
 	repo := openGitRepository(filepath.Join(dir, "tmp"))
@@ -46,6 +49,19 @@ func TestExternalLocalLinksUseCommittedGitHubFiles(t *testing.T) {
 	}
 	if got := resolveLinks("[new](../src/new.go)", "doc.md", nil, nil, repo); got != `\[new\](../src/new.go)` {
 		t.Fatalf("uncommitted file: %q", got)
+	}
+	for _, tc := range []struct{ input, suffix string }{
+		{"[section](../src/guide.md#introduction)", "#introduction"},
+		{"[section](../src/guide.md#%E6%97%A5%E6%9C%AC%E8%AA%9E)", "#%E6%97%A5%E6%9C%AC%E8%AA%9E"},
+	} {
+		got := resolveLinks(tc.input, "doc.md", nil, nil, repo)
+		want := "[section](https://github.com/example/project/blob/" + commit + "/src/guide.md" + tc.suffix + ")"
+		if got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	}
+	if got := resolveLinks("[missing](../src/missing.md#section)", "doc.md", nil, nil, repo); got != `\[missing\](../src/missing.md#section)` {
+		t.Fatalf("unresolved anchor: %q", got)
 	}
 }
 

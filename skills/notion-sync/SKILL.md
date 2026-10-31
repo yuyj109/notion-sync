@@ -44,6 +44,8 @@ notion-sync db query <database-id-or-url> --json
 
 Conflict diffs compare Notion and local content, not the prior baseline. They omit formatting-only blank lines outside code, `<empty-block/>`, and alternate representations of the same page mention. On a terminal, numbered rows use the original Notion Markdown and local file line numbers, with colored backgrounds; `NO_COLOR` disables colors. Redirected output uses an unnumbered normalized diff. Treat this display as a review aid rather than a complete record of ignored formatting differences.
 
+Relative links such as `./guide.md#section` and `#section` resolve to Notion heading blocks after the page content is synchronized. Directory sync refreshes references when target headings are recreated. If `page sync` refuses to rebuild a page referenced by another synchronized file, use a directory sync for the appropriate authorized scope. Missing or unsynchronized targets remain literal text; unsupported Notion blocks and uncertain anchor updates stop for inspection. Source files are not rewritten for links.
+
 Examples (replace IDs and paths with the requested targets):
 
 ```sh

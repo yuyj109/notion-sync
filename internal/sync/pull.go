@@ -184,16 +184,20 @@ func Pull(ctx context.Context, c config.Config, api Client, apply bool, print fu
 		if e.LocalHash == "" || e.RemoteHash == "" {
 			return fmt.Errorf("%s: incomplete synchronization baseline", f.Path)
 		}
-		if f.Hash != e.LocalHash && !reflect.DeepEqual(pullKeys(diffLines(f.SyncBody)), pullKeys(diffLines(m.Markdown))) {
+		comparisonFile, comparisonRemote, err := normalizePullAnchors(ctx, c, api, &s, f, m.Markdown)
+		if err != nil {
+			return fmt.Errorf("%s: %w", f.Path, err)
+		}
+		if f.Hash != e.LocalHash && !reflect.DeepEqual(pullKeys(diffLines(comparisonFile.SyncBody)), pullKeys(diffLines(comparisonRemote))) {
 			return fmt.Errorf("%s: local and Notion contents both changed; resolve manually", f.Path)
 		}
-		body, err := pullBody(f, m.Markdown)
+		body, err := pullBody(comparisonFile, comparisonRemote)
 		if err != nil {
 			return fmt.Errorf("%s: %w", f.Path, err)
 		}
 		actions = append(actions, pullAction{file: f, entry: e, body: body, remote: m.Markdown})
 		print("pull %s <- %s", f.Path, pageURL(e.PageID))
-		if d := makeContentDiff(f.Path, f.SyncBody, m.Markdown, sourceBodyOffset(f), 0); d.Plain != "" {
+		if d := makeContentDiff(f.Path, comparisonFile.SyncBody, comparisonRemote, sourceBodyOffset(f), 0); d.Plain != "" {
 			flip := func(s string) string {
 				s = strings.Replace(s, "--- notion/", "--- local/", 1)
 				return strings.Replace(s, "+++ local/", "+++ notion/", 1)

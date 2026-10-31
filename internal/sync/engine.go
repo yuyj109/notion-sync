@@ -576,6 +576,12 @@ func verifyImageUnchanged(filename, expected string) error {
 	return nil
 }
 func printPlan(p Plan, print func(string, ...any)) {
+	plannedTargets := map[string]bool{}
+	for _, action := range p.Actions {
+		if strings.HasPrefix(action.Key, "file:") && (action.Kind == "create" || action.Kind == "update" || action.Kind == "adopt") {
+			plannedTargets[action.Path] = true
+		}
+	}
 	for _, a := range p.Actions {
 		if a.Kind != "directory-existing" {
 			destination := a.Target
@@ -607,6 +613,19 @@ func printPlan(p Plan, print func(string, ...any)) {
 				print("%s %s -> %s (images replaced: %d)", a.Kind, a.Path, destination, len(a.File.Images))
 			} else {
 				print("%s %s -> %s", a.Kind, a.Path, destination)
+			}
+			checkAnchors := false
+			for _, ref := range a.File.Anchors {
+				if ref.Token != "" || ref.Reason == "target is not synchronized yet" && plannedTargets[ref.Target] {
+					checkAnchors = true
+					continue
+				}
+				if ref.Reason != "" {
+					print("warning %s: anchor %s#%s: %s; unresolved links are kept as text", a.Path, ref.Target, ref.Fragment, ref.Reason)
+				}
+			}
+			if checkAnchors {
+				print("check heading links %s (may update Notion after content sync)", a.Path)
 			}
 		}
 	}
@@ -863,7 +882,10 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 			return err
 		}
 	}
-	return Apply(ctx, c, api, &s, p, print)
+	if err := Apply(ctx, c, api, &s, p, print); err != nil {
+		return err
+	}
+	return finishAnchorSync(ctx, c, api, &s, files, print, overwrite...)
 }
 
 // RunFile limits synchronization to one scanned file; other state entries are retained.
@@ -950,9 +972,78 @@ func RunFile(ctx context.Context, c config.Config, api Client, filename, parentI
 		return err
 	}
 	p.Deleted = nil
+	for target := range headingReferenceTargets(s.Documents[rel].SyncBody, rel) {
+		if target == rel {
+			continue
+		}
+		if _, ok := s.Entries["file:"+target]; !ok {
+			continue
+		}
+		if _, err := validateAnchorTarget(ctx, c, api, &s, target); err != nil {
+			return err
+		}
+	}
+	// Rebuilding a page changes its heading block IDs. A single-file sync must
+	// not leave links in other synchronized files pointing to the old IDs.
+	for _, action := range p.Actions {
+		if action.Key != "file:"+rel || action.Kind != "update" && action.Kind != "create" {
+			continue
+		}
+		for name, doc := range s.Documents {
+			if name == rel {
+				continue
+			}
+			if _, ok := s.Entries["file:"+name]; !ok {
+				continue
+			}
+			if referencesHeading(doc.SyncBody, name, rel) {
+				return fmt.Errorf("%s: other synchronized files link to its headings; use directory sync to update them safely", rel)
+			}
+			other := []File{*doc}
+			prepareLinks(other, s, c.SourcePath)
+			entry := s.Entries["file:"+name]
+			if other[0].Hash != entry.LocalHash {
+				remote, err := validateExisting(ctx, api, entry)
+				if err != nil {
+					return fmt.Errorf("%s: %w", name, err)
+				}
+				if remoteReferencesAnchor(remote.Markdown, s.Entries["file:"+rel].PageID) {
+					return fmt.Errorf("%s: another synchronized page still links to its headings; use directory sync", rel)
+				}
+			}
+		}
+	}
 	printPlan(p, print)
 	if !apply {
 		return nil
 	}
-	return Apply(ctx, c, api, &s, p, print)
+	var shells Plan
+	for _, action := range p.Actions {
+		switch action.Kind {
+		case "directory-create", "directory-existing":
+			shells.Actions = append(shells.Actions, action)
+		case "create":
+			action.Body, action.TextParts, action.File.Images = "", nil, nil
+			action.File.Hash = hash("notion-sync:empty-page-awaiting-content")
+			shells.Actions = append(shells.Actions, action)
+		}
+	}
+	if len(shells.Actions) > 0 {
+		if err := Apply(ctx, c, api, &s, shells, print); err != nil {
+			return err
+		}
+		selected[0] = *s.Documents[rel]
+		if parentID != "" || databaseID != "" {
+			selected[0].ParentID, selected[0].DatabaseID = parentID, databaseID
+		}
+		prepareLinks(selected, s, c.SourcePath)
+		p, err = Build(ctx, c, api, selected, s, overwrite...)
+		if err != nil {
+			return err
+		}
+	}
+	if err := Apply(ctx, c, api, &s, p, print); err != nil {
+		return err
+	}
+	return finishAnchorSync(ctx, c, api, &s, selected, print, overwrite...)
 }

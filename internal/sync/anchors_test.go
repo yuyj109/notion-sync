@@ -24,6 +24,27 @@ func TestLocalHeadingAnchors(t *testing.T) {
 	}
 }
 
+func TestJapaneseHeadingAnchorMatchesNotionFullWidthSpace(t *testing.T) {
+	const fragment = "sss-マッピング"
+	if !localHeadingExists("## SSS マッピング\n", fragment) {
+		t.Fatal("expected local heading to produce the requested anchor")
+	}
+	block := notionAnchorBlock{
+		ID:   "11111111-1111-1111-1111-111111111111",
+		Type: "heading_2",
+		Data: map[string]json.RawMessage{
+			"heading_2": json.RawMessage(`{"rich_text":[{"plain_text":"SSS　マッピング"}]}`),
+		},
+	}
+	headings, err := blockHeadings([]notionAnchorBlock{block})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if headings[fragment] != block.ID {
+		t.Fatalf("Notion heading produced anchors %v; want %q", headings, fragment)
+	}
+}
+
 func TestResolveNotionHeadingLinks(t *testing.T) {
 	id := "11111111-1111-1111-1111-111111111111"
 	docs := map[string]*File{"a.md": {PageID: id, SyncBody: "# A\n"}, "b.md": {PageID: id, SyncBody: "# B\n## 設定\n## 設定\n"}}

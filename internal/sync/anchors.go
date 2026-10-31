@@ -54,7 +54,7 @@ func (s *headingSlugger) next(title string) string {
 		switch {
 		case unicode.IsLetter(r), unicode.IsNumber(r), unicode.IsMark(r), r == '-', r == '_':
 			b.WriteRune(r)
-		case r == ' ':
+		case unicode.IsSpace(r):
 			b.WriteByte('-')
 		}
 	}
@@ -212,6 +212,18 @@ func blockHeadings(blocks []notionAnchorBlock) (map[string]string, error) {
 		result[slugger.next(title.String())] = b.ID
 	}
 	return result, nil
+}
+
+func headingSlugs(headings map[string]string) string {
+	slugs := make([]string, 0, len(headings))
+	for slug := range headings {
+		slugs = append(slugs, slug)
+	}
+	sort.Strings(slugs)
+	if len(slugs) == 0 {
+		return "none"
+	}
+	return strings.Join(slugs, ", ")
 }
 
 type anchorPatch struct {
@@ -476,7 +488,7 @@ func syncAnchors(ctx context.Context, c config.Config, api Client, s *State, fil
 			}
 			blockID := headings[a.Target][a.Fragment]
 			if !config.ValidID(blockID) {
-				return fmt.Errorf("%s: Notion heading %q not found in %s", f.Path, a.Fragment, a.Target)
+				return fmt.Errorf("%s: Notion heading %q not found in %s (available anchors: %s)", f.Path, a.Fragment, a.Target, headingSlugs(headings[a.Target]))
 			}
 			target := s.Entries["file:"+a.Target]
 			key := norm(target.PageID) + "\x00" + a.Label
@@ -684,7 +696,7 @@ func normalizePullAnchors(ctx context.Context, c config.Config, api Client, s *S
 		}
 		blockID := cache[ref.Target][ref.Fragment]
 		if !config.ValidID(blockID) {
-			return f, remote, fmt.Errorf("%s: Notion heading %q not found in %s", f.Path, ref.Fragment, ref.Target)
+			return f, remote, fmt.Errorf("%s: Notion heading %q not found in %s (available anchors: %s)", f.Path, ref.Fragment, ref.Target, headingSlugs(cache[ref.Target]))
 		}
 		urls[ref.Token] = anchorPlaceholder(e.PageID, ref.Token) + "#" + norm(blockID)
 		refs[ref.Token], allowed[ref.Token] = ref, true

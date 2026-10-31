@@ -13,6 +13,7 @@ Check that both `notion-sync` and the official Notion CLI `ntn` are available:
 
 ```sh
 notion-sync --help
+notion-sync --version
 ntn --help
 ```
 

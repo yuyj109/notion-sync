@@ -47,8 +47,15 @@ func execute(root *cobra.Command) error {
 }
 
 func Execute() error {
+	root := newRootCommand()
+	root.SetContext(context.Background())
+	return execute(root)
+}
+
+func newRootCommand() *cobra.Command {
 	var opts runtimeOptions
-	root := &cobra.Command{Use: "notion-sync", Short: "Synchronize local Markdown to Notion", SilenceUsage: true, SilenceErrors: true}
+	version := buildVersion()
+	root := &cobra.Command{Use: "notion-sync", Short: "Synchronize local Markdown to Notion", Long: "Synchronize local Markdown to Notion\n\nVersion: " + version, Version: version, SilenceUsage: true, SilenceErrors: true}
 	opts.addFlags(root)
 	root.AddCommand(&cobra.Command{Use: "init", Short: "Create an .env file", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
 		if err := config.InitEnv(opts.envFile); err != nil {
@@ -110,6 +117,5 @@ func Execute() error {
 	addBrowseCommands(root)
 	addAuthCommands(root)
 	showHelpOnMissingParameters(root)
-	root.SetContext(context.Background())
-	return execute(root)
+	return root
 }

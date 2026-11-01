@@ -20,7 +20,7 @@ func TestRemoveStaleLockRequiresConfirmation(t *testing.T) {
 		t.Fatal(err)
 	}
 	name := filepath.Join(t.TempDir(), "sync.lock")
-	if err := os.WriteFile(name, []byte(fmt.Sprint(pid)), 0600); err != nil {
+	if err := os.WriteFile(name, fmt.Append(nil, pid), 0600); err != nil {
 		t.Fatal(err)
 	}
 	lockErr := &LockExistsError{Path: name}
@@ -47,7 +47,7 @@ func TestRemoveStaleLockRequiresConfirmation(t *testing.T) {
 
 func TestRemoveStaleLockRejectsLiveOrReplacedLock(t *testing.T) {
 	name := filepath.Join(t.TempDir(), "sync.lock")
-	if err := os.WriteFile(name, []byte(fmt.Sprint(os.Getpid())), 0600); err != nil {
+	if err := os.WriteFile(name, fmt.Append(nil, os.Getpid()), 0600); err != nil {
 		t.Fatal(err)
 	}
 	called := false
@@ -70,14 +70,14 @@ func TestRemoveStaleLockRejectsReplacedLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	name := filepath.Join(t.TempDir(), "sync.lock")
-	if err := os.WriteFile(name, []byte(fmt.Sprint(pid)), 0600); err != nil {
+	if err := os.WriteFile(name, fmt.Append(nil, pid), 0600); err != nil {
 		t.Fatal(err)
 	}
 	_, err := RemoveStaleLock(&LockExistsError{Path: name}, func(string, int) (bool, error) {
 		if err := os.Remove(name); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(name, []byte(fmt.Sprint(os.Getpid())), 0600); err != nil {
+		if err := os.WriteFile(name, fmt.Append(nil, os.Getpid()), 0600); err != nil {
 			t.Fatal(err)
 		}
 		return true, nil

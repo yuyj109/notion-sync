@@ -465,7 +465,7 @@ func TestRepeatedAnchorsWithMixedMarkers(t *testing.T) {
 	c, base, dir := setup(t)
 	api := &testAnchorAPI{fakeAPI: base, blocks: map[string][]testAnchorBlock{}}
 	name := ""
-	for index := 0; index < 100; index++ {
+	for index := range 100 {
 		candidate := fmt.Sprintf("a%d.md", index)
 		identity := candidate + "\x00b.md\x00b\x00"
 		if hash(identity+"0") > hash(identity+"1") {

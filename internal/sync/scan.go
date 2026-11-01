@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -230,7 +231,7 @@ func imageContentType(ext string) string {
 	}
 }
 
-func bodyWithoutImages(body string, markdownPath string) (string, []int, error) {
+func bodyWithoutImages(body string) (string, []int, error) {
 	lines := strings.Split(body, "\n")
 	var indices []int
 	var textLines []string
@@ -419,7 +420,7 @@ func yamlFrontmatter(data []byte) (*yaml.Node, string, string, error) {
 		return nil, "", "", fmt.Errorf("invalid YAML: %w", err)
 	}
 	var extra yaml.Node
-	if err := dec.Decode(&extra); err != io.EOF {
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 		return nil, "", "", fmt.Errorf("frontmatter must contain one YAML document")
 	}
 	if len(root.Content) != 1 || root.Content[0].Kind != yaml.MappingNode {
@@ -529,7 +530,7 @@ func resolveImages(f *File, sourceRoot string) error {
 		return err
 	}
 	f.Images = images
-	if _, _, err := bodyWithoutImages(f.SyncBody, f.Path); err != nil {
+	if _, _, err := bodyWithoutImages(f.SyncBody); err != nil {
 		return err
 	}
 	return nil

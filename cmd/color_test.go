@@ -13,10 +13,12 @@ type testDiffView struct{}
 func (testDiffView) String() string       { return "--- notion/a\n-old" }
 func (testDiffView) NumberedDiff() string { return "--- notion/a\n-   8      │ old" }
 
-type testDiffError struct{ testDiffView }
+type testDiffError struct{ *testDiffView }
 
-func (testDiffError) Error() string                 { return "conflict\n--- notion/a\n-old" }
-func (d testDiffError) DiffViews() (string, string) { return d.String(), d.NumberedDiff() }
+func (*testDiffError) Error() string { return "conflict\n--- notion/a\n-old" }
+func (d *testDiffError) DiffViews() (string, string) {
+	return d.String(), d.NumberedDiff()
+}
 
 func TestNumberedDiffWithAndWithoutColor(t *testing.T) {
 	d := testDiffView{}
@@ -26,7 +28,7 @@ func TestNumberedDiffWithAndWithoutColor(t *testing.T) {
 	if got := syncMessage(false, "%s", d); got != d.String() {
 		t.Fatalf("redirected output: %q", got)
 	}
-	err := fmt.Errorf("a.md: %w", testDiffError{d})
+	err := fmt.Errorf("a.md: %w", &testDiffError{&d})
 	plainTerminal := formatError(err, true, false)
 	if !strings.Contains(plainTerminal, "-   8      │ old") || strings.Contains(plainTerminal, "\x1b[") {
 		t.Fatalf("numbered output without color: %q", plainTerminal)

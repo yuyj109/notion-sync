@@ -2,6 +2,12 @@ version: "2"
 
 linters:
   default: standard
+  enable:
+    - errorlint
+    - gocheckcompilerdirectives
+    - modernize
+    - nolintlint
+    - gocritic
 
 formatters:
   enable:
@@ -10,3 +16,15 @@ formatters:
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
+  fix: false
+
+output:
+  formats:
+    text:
+      path: stdout
+      print-linter-name: true
+      print-issued-lines: true
+
+run:
+  timeout: 5m
+  tests: true

@@ -41,7 +41,8 @@ func Reset(target string, dryRun bool, print func(string, ...any)) error {
 		defer unlock()
 	}
 	var paths []string
-	if info.IsDir() {
+	switch {
+	case info.IsDir():
 		err = filepath.WalkDir(target, func(name string, d os.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
@@ -57,9 +58,9 @@ func Reset(target string, dryRun bool, print func(string, ...any)) error {
 		if err != nil {
 			return err
 		}
-	} else if info.Mode().IsRegular() && strings.EqualFold(filepath.Ext(target), ".md") {
+	case info.Mode().IsRegular() && strings.EqualFold(filepath.Ext(target), ".md"):
 		paths = append(paths, target)
-	} else {
+	default:
 		return fmt.Errorf("target must be a Markdown file or directory")
 	}
 	sort.Strings(paths)

@@ -65,7 +65,7 @@ func (r Runner) command(ctx context.Context, input []byte, args ...string) ([]by
 	}
 	if err != nil {
 		e := &APIError{ExitCode: -1, Detail: "check ntn installation and login"}
-		if ex, ok := err.(*exec.ExitError); ok {
+		if ex, ok := errors.AsType[*exec.ExitError](err); ok {
 			e.ExitCode = ex.ExitCode()
 		}
 		if m := statusPattern.FindStringSubmatch(stderr.String()); len(m) > 1 {

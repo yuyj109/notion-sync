@@ -142,11 +142,12 @@ func Pull(ctx context.Context, c config.Config, api Client, apply bool, print fu
 		if !ok {
 			continue
 		}
-		if f.ParentID != "" {
+		switch {
+		case f.ParentID != "":
 			if e.ParentType != "page_id" || norm(e.ParentID) != norm(f.ParentID) || !strings.HasPrefix(e.Target, "page:") && e.Target != "parent:"+norm(f.ParentID) {
 				return fmt.Errorf("%s: destination changed; resolve manually", f.Path)
 			}
-		} else if f.DatabaseID != "" {
+		case f.DatabaseID != "":
 			if !strings.HasPrefix(e.Target, "page:") && e.Target != "database:"+norm(f.DatabaseID) {
 				return fmt.Errorf("%s: destination changed; resolve manually", f.Path)
 			}
@@ -157,7 +158,7 @@ func Pull(ctx context.Context, c config.Config, api Client, apply bool, print fu
 			if e.ParentType != "data_source_id" || norm(e.ParentID) != norm(ds) {
 				return fmt.Errorf("%s: destination changed; resolve manually", f.Path)
 			}
-		} else if strings.HasPrefix(e.Target, "hierarchy:") {
+		case strings.HasPrefix(e.Target, "hierarchy:"):
 			expected := "hierarchy:"
 			if dir := path.Dir(f.Path); c.Sync.PreserveHierarchy && dir != "." {
 				expected += dir

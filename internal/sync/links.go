@@ -120,7 +120,11 @@ func resolveLinksWithAnchors(body, filename string, documents map[string]*File, 
 			if link == "" {
 				out.WriteString(literalMarkdown.Replace(body[start:end]))
 			} else {
-				out.WriteString("[" + label + "](" + link + ")")
+				out.WriteByte('[')
+				out.WriteString(label)
+				out.WriteString("](")
+				out.WriteString(link)
+				out.WriteByte(')')
 			}
 			last = end
 			continue
@@ -174,12 +178,20 @@ func resolveLinksWithAnchors(body, filename string, documents map[string]*File, 
 			occurrences[identity]++
 			anchors = append(anchors, AnchorRef{Token: token, Target: target, Fragment: u.Fragment, Label: anchorLabel(label)})
 			out.WriteString(body[last:start])
-			out.WriteString("[" + label + "](" + anchorPlaceholder(id, token) + ")")
+			out.WriteByte('[')
+			out.WriteString(label)
+			out.WriteString("](")
+			out.WriteString(anchorPlaceholder(id, token))
+			out.WriteByte(')')
 			last = end
 			continue
 		}
 		out.WriteString(body[last:start])
-		out.WriteString(`<mention-page url="` + pageURL(id) + `">` + html.EscapeString(label) + `</mention-page>`)
+		out.WriteString(`<mention-page url="`)
+		out.WriteString(pageURL(id))
+		out.WriteString(`">`)
+		out.WriteString(html.EscapeString(label))
+		out.WriteString(`</mention-page>`)
 		last = end
 	}
 	out.WriteString(body[last:])

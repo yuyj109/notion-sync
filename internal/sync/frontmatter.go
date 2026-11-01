@@ -125,16 +125,17 @@ func readFlat(node *yaml.Node, f *File) error {
 		e := Entry{PageID: f.PageID, ParentID: root, ParentType: "page_id", Target: "hierarchy:", LocalHash: values["notion-local-hash"], RemoteHash: values["notion-remote-hash"]}
 		e.ImageHashes = imageHashes
 		e.ImageBlocks = imageBlocks
-		if hasTarget {
+		switch {
+		case hasTarget:
 			e.Target = values["notion-target"]
 			if e.Target == "page" {
 				e.Target = "page:" + norm(f.PageID)
 			} else if kind, id, ok := strings.Cut(e.Target, ":"); ok && (kind == "parent" || kind == "database") && config.ValidID(id) {
 				e.Target = kind + ":" + norm(id)
 			}
-		} else if f.ParentID != "" {
+		case f.ParentID != "":
 			e.Target = "parent:" + norm(f.ParentID)
-		} else if f.DatabaseID != "" {
+		case f.DatabaseID != "":
 			e.Target = "database:" + norm(f.DatabaseID)
 		}
 		if hasParent {

@@ -224,7 +224,8 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 		target := "dir:" + parentDir
 		e, exists := s.Entries[key]
 		a := Action{Key: key, Path: d, Title: path.Base(d), Target: target, ParentID: parentID, ParentType: "page_id", Entry: e}
-		if exists {
+		switch {
+		case exists:
 			if e.Target != target || parentID == "" || norm(e.ParentID) != norm(parentID) {
 				return plan, fmt.Errorf("directory destination changed for %s", d)
 			}
@@ -232,7 +233,7 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 				return plan, fmt.Errorf("%s: %w", d, err)
 			}
 			a.Kind = "directory-existing"
-		} else {
+		default:
 			for _, f := range files {
 				if strings.HasPrefix(f.Path, d+"/") {
 					if existing, ok := s.Entries["file:"+f.Path]; ok && strings.HasPrefix(existing.Target, "hierarchy:") {
@@ -251,7 +252,7 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 		title := pageTitle(f.SyncBody, f.Path)
 		a := Action{Key: key, Path: f.Path, Title: title, File: f}
 		var splitErr error
-		a.Body, _, splitErr = bodyWithoutImages(f.SyncBody, f.Path)
+		a.Body, _, splitErr = bodyWithoutImages(f.SyncBody)
 		if splitErr != nil {
 			return plan, splitErr
 		}
@@ -320,7 +321,8 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 			}
 			seen[id] = key
 		}
-		if exists {
+		switch {
+		case exists:
 			a.Entry = e
 			if e.RemoteHash == "" || e.LocalHash == "" {
 				return plan, fmt.Errorf("%s: incomplete synchronization baseline", f.Path)
@@ -347,9 +349,10 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 				e.RemoteHash = remoteMarkdownHash(m.Markdown)
 				a.Entry = e
 			}
-			if conflict {
+			switch {
+			case conflict:
 				a.Kind = "update"
-			} else if f.Hash == e.LocalHash {
+			case f.Hash == e.LocalHash:
 				if len(changedImages(f.Images, e.ImageHashes)) > 0 {
 					a.Kind = "images-update"
 				} else {
@@ -364,10 +367,10 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 						a.Kind = "normalize"
 					}
 				}
-			} else {
+			default:
 				a.Kind = "update"
 			}
-		} else if f.PageID != "" {
+		case f.PageID != "":
 			p, err := getPage(ctx, api, f.PageID)
 			if err != nil {
 				return plan, fmt.Errorf("%s: %w", f.Path, err)
@@ -401,7 +404,7 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 			} else {
 				a.Kind = "update"
 			}
-		} else {
+		default:
 			if a.ParentID != "" && a.ParentType == "page_id" {
 				if _, err := getPage(ctx, api, a.ParentID); err != nil {
 					return plan, fmt.Errorf("%s: parent: %w", f.Path, err)
@@ -429,7 +432,7 @@ func appendImages(ctx context.Context, api Client, pageID string, action Action,
 	if !uploadOK {
 		return nil, fmt.Errorf("file uploads are not supported by the Notion client")
 	}
-	if _, _, err := bodyWithoutImages(action.File.SyncBody, action.Path); err != nil {
+	if _, _, err := bodyWithoutImages(action.File.SyncBody); err != nil {
 		return nil, err
 	}
 	if len(action.TextParts) > 0 && len(action.TextParts) != len(action.File.Images)+1 {
@@ -598,24 +601,25 @@ func printPlan(p Plan, print func(string, ...any)) {
 					destination = a.ParentType + ":" + a.ParentID
 				}
 			}
-			if a.Overwrite {
+			switch {
+			case a.Overwrite:
 				print("overwrite %s -> %s (Notion content changed)", a.Path, destination)
 				if a.ConflictDiff != "" {
 					print("%s", DiffOutput{Plain: a.ConflictDiff, Numbered: a.ConflictDiffNumbered})
 				}
-			} else if a.Kind == "images-update" {
+			case a.Kind == "images-update":
 				images := changedImages(a.File.Images, a.Entry.ImageHashes)
 				print("update images (%d) %s -> %s", len(images), a.Path, destination)
-			} else if len(a.File.Images) > 0 && (a.Kind == "unchanged" || a.Kind == "normalize") {
+			case len(a.File.Images) > 0 && (a.Kind == "unchanged" || a.Kind == "normalize"):
 				changed := changedImages(a.File.Images, a.Entry.ImageHashes)
 				if len(changed) > 0 {
 					print("%s %s -> %s (images changed: %d)", a.Kind, a.Path, destination, len(changed))
 				} else {
 					print("%s %s -> %s (images unchanged: %d; not uploaded)", a.Kind, a.Path, destination, len(a.File.Images))
 				}
-			} else if a.Kind == "update" && len(a.File.Images) > 0 {
+			case a.Kind == "update" && len(a.File.Images) > 0:
 				print("%s %s -> %s (images replaced: %d)", a.Kind, a.Path, destination, len(a.File.Images))
-			} else {
+			default:
 				print("%s %s -> %s", a.Kind, a.Path, destination)
 			}
 			checkAnchors := false

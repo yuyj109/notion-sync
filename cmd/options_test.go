@@ -150,9 +150,10 @@ esac
 				if kind == "database" {
 					parentType = "db"
 				}
-				if command == "sync typed" || command == "page sync typed" {
+				switch command {
+				case "sync typed", "page sync typed":
 					args = append(args, "--parent-type", parentType)
-				} else if command == "sync typed env" {
+				case "sync typed env":
 					t.Setenv("NOTION_SYNC_PARENT_TYPE", parentType)
 				}
 				if err := os.WriteFile(filepath.Join(dir, "settings.env"), nil, 0600); err != nil {

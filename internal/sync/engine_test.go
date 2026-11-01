@@ -764,6 +764,24 @@ func TestLocalImageRejectsOutsideSourceAndCodeFence(t *testing.T) {
 	}
 }
 
+func TestLocalSVGImageUsesSVGContentType(t *testing.T) {
+	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "diagram.svg"), []byte(`<svg xmlns="http://www.w3.org/2000/svg"/>`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	images, err := localImages("![diagram](diagram.svg)", "guide.md", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(images) != 1 || images[0].ContentType != "image/svg+xml" {
+		t.Fatalf("unexpected SVG image: %+v", images)
+	}
+}
+
 func TestRemoteImageHashIgnoresExpiringSignature(t *testing.T) {
 	a := remoteMarkdownHash("![image](<https://files.notion.so/image.png?signature=one>)")
 	b := remoteMarkdownHash("![image](<https://files.notion.so/image.png?signature=two>)")

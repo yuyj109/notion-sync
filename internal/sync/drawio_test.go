@@ -27,6 +27,50 @@ type managedEmbedClient struct {
 	children []any
 }
 
+type updatingEmbedClient struct {
+	*managedEmbedClient
+	patches  int
+	warnings []jsonWarning
+}
+
+type embedAndPagesClient struct {
+	*fakeAPI
+	embedID string
+}
+
+func (c *embedAndPagesClient) API(ctx context.Context, method, endpoint string, body any, out any) error {
+	if method == "GET" && strings.Contains(endpoint, "/children") {
+		data, _ := json.Marshal(map[string]any{"results": []any{map[string]any{"id": c.embedID, "type": "embed"}}, "has_more": false})
+		return json.Unmarshal(data, out)
+	}
+	return c.fakeAPI.API(ctx, method, endpoint, body, out)
+}
+
+func (c *updatingEmbedClient) API(ctx context.Context, method, endpoint string, body any, out any) error {
+	if method == "PATCH" && strings.HasSuffix(endpoint, "/markdown") {
+		request := body.(map[string]any)
+		if request["type"] != "update_content" {
+			return fmt.Errorf("unexpected markdown update: %v", request["type"])
+		}
+		for _, item := range request["update_content"].(map[string]any)["content_updates"].([]any) {
+			update := item.(map[string]any)
+			old := update["old_str"].(string)
+			if strings.Count(c.markdown, old) != 1 {
+				return fmt.Errorf("ambiguous update")
+			}
+			c.markdown = strings.Replace(c.markdown, old, update["new_str"].(string), 1)
+		}
+		c.patches++
+	}
+	if err := c.managedEmbedClient.API(ctx, method, endpoint, body, out); err != nil {
+		return err
+	}
+	if method == "PATCH" && strings.HasSuffix(endpoint, "/markdown") {
+		out.(*markdown).Warnings = c.warnings
+	}
+	return nil
+}
+
 func (c *managedEmbedClient) API(_ context.Context, method, endpoint string, _ any, out any) error {
 	var value any
 	switch {
@@ -261,8 +305,8 @@ func TestAppendedTextPreservesExistingDrawioEmbed(t *testing.T) {
 	f.SyncBody = strings.Replace(f.SyncBody, "# Changed", "# Guide", 1)
 	f.Images[1].StateHash = "changed"
 	added, err = appendedDrawioText(context.Background(), client, entry, f, remote)
-	if err != nil || added != "" {
-		t.Fatalf("must not append when the diagram changed: %q, %v", added, err)
+	if err != nil || added != ".\ntest" {
+		t.Fatalf("diagram changes should not block text append: %q, %v", added, err)
 	}
 }
 
@@ -281,7 +325,167 @@ func TestPageUpdateProtectsFilledManagedEmbed(t *testing.T) {
 		t.Fatalf("expected protected page to be skipped, got %v", err)
 	}
 	joined := strings.Join(warnings, "\n")
-	if !strings.Contains(joined, "page not synchronized") || !strings.Contains(joined, filepath.Join(cfg.WorkDir, ".notion-sync", "diagram.drawio.svg.txt")) {
+	if !strings.Contains(joined, "page not synchronized") || !strings.Contains(joined, "cannot be preserved safely") {
 		t.Fatalf("missing manual instructions: %s", joined)
+	}
+}
+
+func TestUpdateTextAroundExistingDrawioEmbed(t *testing.T) {
+	cfg, _, dir := setup(t)
+	cfg.Sync.DrawioEmbed = true
+	write(t, filepath.Join(dir, "home.md"), "# New heading\n\n![diagram](diagram.drawio.svg)\n\nNew body\n")
+	write(t, filepath.Join(dir, "diagram.drawio.svg"), "changed diagram")
+	files, err := Scan(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := files[0]
+	file.Images[0].StateHash = hash("drawio-embed:" + file.Images[0].Hash)
+	parts, err := imageTextParts(file.SyncBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockID := "11111111-1111-1111-1111-111111111111"
+	remote := "# Old heading\n<embed src=\"https://example.com/manual\"></embed>\nOld body"
+	client := &updatingEmbedClient{managedEmbedClient: &managedEmbedClient{markdown: remote, children: []any{map[string]any{"id": blockID, "type": "embed"}}}}
+	entry := Entry{PageID: rootID, ParentID: rootID, ParentType: "page_id", RemoteHash: remoteMarkdownHash(strings.Replace(remote, "https://example.com/manual", "", 1)), ImageBlocks: map[string]string{"image-1": blockID}, ImageHashes: map[string]string{"image-1": "old-hash"}, managedEmbeds: map[string]bool{norm(blockID): true}}
+	state, err := loadState(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Active["home.md"] = true
+	state.Entries["file:home.md"] = entry
+	action := Action{Kind: "update", Key: "file:home.md", Path: "home.md", Entry: entry, File: file, TextParts: parts}
+	if err := exportDrawioURL(cfg, Plan{Actions: []Action{action}}, true, nil); err != nil {
+		t.Fatalf("existing embed should skip diagram export: %v", err)
+	}
+	if err := Apply(context.Background(), cfg, client, &state, Plan{Actions: []Action{action}}, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	if client.patches != 1 || client.markdown != "# New heading\n<embed src=\"https://example.com/manual\"></embed>\nNew body" {
+		t.Fatalf("unexpected update: patches=%d markdown=%q", client.patches, client.markdown)
+	}
+	if len(state.Skipped) != 0 || state.Entries[action.Key].ImageBlocks["image-1"] != blockID || state.Entries[action.Key].ImageHashes["image-1"] != "old-hash" {
+		t.Fatalf("embed state not preserved: %+v", state.Entries[action.Key])
+	}
+}
+
+func TestDrawioEmbedChangesDoNotTriggerPageUpdate(t *testing.T) {
+	blockID := "11111111-1111-1111-1111-111111111111"
+	remote := "# Guide\n<embed src=\"https://example.com/manual\"></embed>"
+	client := &managedEmbedClient{markdown: remote, children: []any{map[string]any{"id": blockID, "type": "embed"}}}
+	image := Image{Key: "image-1", Path: "diagram.drawio.svg", Name: "diagram.drawio.svg", Hash: "new-diagram-hash", SourceLine: "![diagram](diagram.drawio.svg)"}
+	file := File{Path: "page.md", SyncBody: "# Guide\n![diagram](diagram.drawio.svg)", Hash: "unchanged-body", Images: []Image{image}}
+	entry := Entry{PageID: rootID, ParentID: rootID, ParentType: "page_id", Target: "hierarchy:", LocalHash: file.Hash, RemoteHash: remoteMarkdownHash(strings.Replace(remote, "https://example.com/manual", "", 1)), ImageBlocks: map[string]string{"image-1": blockID}, ImageHashes: map[string]string{"image-1": "previous-diagram-hash"}}
+	state := State{Entries: map[string]Entry{"file:page.md": entry}}
+	var cfg config.Config
+	cfg.Notion.ParentPageID, cfg.Sync.DrawioEmbed = rootID, true
+	plan, err := Build(context.Background(), cfg, client, []File{file}, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Actions) != 1 || plan.Actions[0].Kind != "unchanged" {
+		t.Fatalf("diagram change triggered an update: %+v", plan.Actions)
+	}
+}
+
+func TestDrawioModeSwitchStillUpdatesOrdinaryImage(t *testing.T) {
+	blockID := "11111111-1111-1111-1111-111111111111"
+	client := &managedEmbedClient{children: []any{map[string]any{"id": blockID, "type": "image"}}}
+	image := Image{Key: "image-1", Path: "diagram.drawio.svg", Name: "diagram.drawio.svg", Hash: "new-diagram-hash", StateHash: hash("drawio-embed:new-diagram-hash")}
+	entry := Entry{PageID: rootID, ImageBlocks: map[string]string{"image-1": blockID}, ImageHashes: map[string]string{"image-1": "previous-image-hash"}}
+	if err := identifyManagedDrawioEmbeds(context.Background(), client, &entry, []Image{image}); err != nil {
+		t.Fatal(err)
+	}
+	if len(entry.managedEmbeds) != 0 || len(changedUnmanagedImages([]Image{image}, entry)) != 1 {
+		t.Fatal("ordinary image must still be converted when enabling embed mode")
+	}
+}
+
+func TestDrawioUpdateReportsWarningsWithoutSavingBaseline(t *testing.T) {
+	cfg, _, dir := setup(t)
+	cfg.Sync.DrawioEmbed = true
+	write(t, filepath.Join(dir, "home.md"), "# New\n\n![diagram](diagram.drawio.svg)\n\nNew body\n")
+	write(t, filepath.Join(dir, "diagram.drawio.svg"), "diagram")
+	files, err := Scan(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := files[0]
+	parts, err := imageTextParts(file.SyncBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockID := "11111111-1111-1111-1111-111111111111"
+	remote := "# Old\n<embed src=\"https://example.com/manual\"></embed>\nOld body"
+	client := &updatingEmbedClient{managedEmbedClient: &managedEmbedClient{markdown: remote, children: []any{map[string]any{"id": blockID, "type": "embed"}}}, warnings: []jsonWarning{{Code: "no_match", Message: "a replacement did not match"}}}
+	entry := Entry{PageID: rootID, ParentID: rootID, ParentType: "page_id", LocalHash: "old-local", RemoteHash: remoteMarkdownHash(strings.Replace(remote, "https://example.com/manual", "", 1)), ImageBlocks: map[string]string{"image-1": blockID}, managedEmbeds: map[string]bool{norm(blockID): true}}
+	state, err := loadState(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Active["home.md"] = true
+	state.Entries["file:home.md"] = entry
+	action := Action{Kind: "update", Key: "file:home.md", Path: "home.md", Entry: entry, File: file, TextParts: parts}
+	err = Apply(context.Background(), cfg, client, &state, Plan{Actions: []Action{action}}, func(string, ...any) {})
+	if err == nil || !strings.Contains(err.Error(), "no_match: a replacement did not match") || !strings.Contains(err.Error(), "partially applied") {
+		t.Fatalf("missing warning details: %v", err)
+	}
+	if client.patches != 1 || state.Entries[action.Key].LocalHash != entry.LocalHash || state.Entries[action.Key].RemoteHash != entry.RemoteHash {
+		t.Fatalf("baseline changed after a warning: patches=%d entry=%+v", client.patches, state.Entries[action.Key])
+	}
+}
+
+func TestMarkdownUpdateIssueReportsIncompleteResponse(t *testing.T) {
+	truncated := true
+	issue := markdownUpdateIssue(markdown{Object: "page_markdown", ID: rootID, Truncated: &truncated, Unknown: []string{"block"}}, rootID)
+	if !strings.Contains(issue, "truncated") || !strings.Contains(issue, "1 unknown blocks") {
+		t.Fatalf("missing incomplete response details: %s", issue)
+	}
+}
+
+func TestDrawioTextUpdatesRejectAmbiguousOrReorderedEmbeds(t *testing.T) {
+	first := "11111111-1111-1111-1111-111111111111"
+	second := "22222222-2222-2222-2222-222222222222"
+	client := &managedEmbedClient{children: []any{map[string]any{"id": first, "type": "embed"}, map[string]any{"id": second, "type": "embed"}}}
+	action := Action{Entry: Entry{PageID: rootID, ImageBlocks: map[string]string{"a": first, "b": second}, managedEmbeds: map[string]bool{norm(first): true, norm(second): true}}, File: File{Images: []Image{{Key: "a", Name: "a.drawio.svg"}, {Key: "b", Name: "b.drawio.svg"}}}, TextParts: []string{"changed", "middle", "end"}}
+	remote := "same\n<embed src=\"a\"></embed>\nmiddle\n<embed src=\"b\"></embed>\nsame"
+	if _, safe, err := drawioTextUpdates(context.Background(), client, action, remote); err != nil || safe {
+		t.Fatalf("ambiguous text must be rejected: safe=%v err=%v", safe, err)
+	}
+	action.TextParts[0] = "same"
+	client.children[0], client.children[1] = client.children[1], client.children[0]
+	if _, safe, err := drawioTextUpdates(context.Background(), client, action, remote); err != nil || safe {
+		t.Fatalf("reordered embeds must be rejected: safe=%v err=%v", safe, err)
+	}
+}
+
+func TestSkippedEmbedPageDoesNotBlockOtherPages(t *testing.T) {
+	cfg, base, dir := setup(t)
+	cfg.Sync.DrawioEmbed = true
+	write(t, filepath.Join(dir, "home.md"), "# Home\n")
+	write(t, filepath.Join(dir, "other.md"), "# New\n\n[home](./home.md#home)\n")
+	state, err := loadState(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Active["home.md"], state.Active["other.md"] = true, true
+	embedID := "11111111-1111-1111-1111-111111111111"
+	otherID := "22222222-2222-2222-2222-222222222222"
+	base.pages[norm(rootID)].content = `<embed src="https://example.com/manual"></embed>`
+	base.pages[norm(otherID)] = &fakePage{parent: rootID, content: "# Old"}
+	home := Entry{PageID: rootID, managedEmbeds: map[string]bool{norm(embedID): true}}
+	other := Entry{PageID: otherID, ParentID: rootID, ParentType: "page_id", RemoteHash: remoteMarkdownHash("# Old")}
+	state.Entries["file:home.md"], state.Entries["file:other.md"] = home, other
+	plan := Plan{Actions: []Action{
+		{Kind: "update", Key: "file:home.md", Path: "home.md", Entry: home, File: File{Images: []Image{{Name: "diagram.drawio.svg"}}}},
+		{Kind: "update", Key: "file:other.md", Path: "other.md", Entry: other, File: *state.Documents["other.md"], Body: "# New"},
+	}}
+	client := &embedAndPagesClient{fakeAPI: base, embedID: embedID}
+	if err := Apply(context.Background(), cfg, client, &state, plan, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	if !state.Skipped["home.md"] || state.Skipped["other.md"] || base.pages[norm(otherID)].content != "# New" {
+		t.Fatalf("unrelated page was blocked: skipped=%v content=%q", state.Skipped, base.pages[norm(otherID)].content)
 	}
 }

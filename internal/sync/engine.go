@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -42,6 +43,42 @@ type jsonWarning struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 }
+
+func markdownUpdateIssue(m markdown, pageID string) string {
+	var issues []string
+	if m.Object != "page_markdown" || norm(m.ID) != norm(pageID) {
+		issues = append(issues, "unexpected response object or page ID")
+	}
+	if m.Truncated == nil {
+		issues = append(issues, "response omitted truncation status")
+	} else if *m.Truncated {
+		issues = append(issues, "response content was truncated")
+	}
+	if len(m.Unknown) > 0 {
+		issues = append(issues, fmt.Sprintf("response contains %d unknown blocks", len(m.Unknown)))
+	} else if strings.Contains(m.Markdown, "<unknown") {
+		issues = append(issues, "response contains unknown content")
+	}
+	for _, warning := range m.Warnings {
+		message := []rune(strings.TrimSpace(warning.Message))
+		if len(message) > 500 {
+			message = append(message[:500], []rune("...")...)
+		}
+		detail := strings.TrimSpace(warning.Code)
+		if len(message) > 0 {
+			if detail != "" {
+				detail += ": "
+			}
+			detail += string(message)
+		}
+		if detail == "" {
+			detail = "unspecified warning"
+		}
+		issues = append(issues, detail)
+	}
+	return strings.Join(issues, "; ")
+}
+
 type Action struct {
 	Kind, Key, Path, Title, Target, ParentID, ParentType, DataSourceID, TitleProperty string
 	File                                                                              File
@@ -341,7 +378,9 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 		switch {
 		case exists:
 			if c.Sync.DrawioEmbed {
-				trackDrawioEmbeds(&e, f.Images)
+				if err := identifyManagedDrawioEmbeds(ctx, api, &e, f.Images); err != nil {
+					return plan, fmt.Errorf("%s: %w", f.Path, err)
+				}
 				s.Entries[key] = e
 			}
 			a.Entry = e
@@ -381,7 +420,7 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 			case conflict:
 				a.Kind = "update"
 			case f.Hash == e.LocalHash:
-				changed := changedImages(f.Images, e.ImageHashes)
+				changed := changedUnmanagedImages(f.Images, e)
 				if hasDrawioSVG(changed) {
 					a.Kind = "update"
 				} else if len(changed) > 0 {
@@ -506,8 +545,8 @@ func appendImages(ctx context.Context, api Client, pageID string, action Action,
 			if err := api.API(ctx, "PATCH", "v1/pages/"+pageID+"/markdown", body, &inserted); err != nil {
 				return nil, fmt.Errorf("%s: Markdown after image insertion has uncertain outcome; inspect Notion before retry: %w", action.Path, err)
 			}
-			if inserted.Object != "page_markdown" || norm(inserted.ID) != norm(pageID) || inserted.Truncated == nil || *inserted.Truncated || len(inserted.Unknown) > 0 || len(inserted.Warnings) > 0 {
-				return nil, fmt.Errorf("%s: Markdown after image insertion returned warnings or incomplete content", action.Path)
+			if issue := markdownUpdateIssue(inserted, pageID); issue != "" {
+				return nil, fmt.Errorf("%s: Markdown after image insertion returned warnings or incomplete content: %s; inspect Notion before retrying", action.Path, issue)
 			}
 		}
 	}
@@ -621,12 +660,6 @@ func verifyImageUnchanged(filename, expected string) error {
 	return nil
 }
 func printPlan(p Plan, print func(string, ...any)) {
-	plannedTargets := map[string]bool{}
-	for _, action := range p.Actions {
-		if strings.HasPrefix(action.Key, "file:") && (action.Kind == "create" || action.Kind == "update" || action.Kind == "adopt") {
-			plannedTargets[action.Path] = true
-		}
-	}
 	for _, a := range p.Actions {
 		if a.Kind != "directory-existing" {
 			destination := a.Target
@@ -646,12 +679,14 @@ func printPlan(p Plan, print func(string, ...any)) {
 					print("%s", DiffOutput{Plain: a.ConflictDiff, Numbered: a.ConflictDiffNumbered})
 				}
 			case a.Kind == "images-update":
-				images := changedImages(a.File.Images, a.Entry.ImageHashes)
+				images := changedUnmanagedImages(a.File.Images, a.Entry)
 				print("update images (%d) %s -> %s", len(images), a.Path, destination)
 			case len(a.File.Images) > 0 && (a.Kind == "unchanged" || a.Kind == "normalize"):
-				changed := changedImages(a.File.Images, a.Entry.ImageHashes)
+				changed := changedUnmanagedImages(a.File.Images, a.Entry)
 				if len(changed) > 0 {
 					print("%s %s -> %s (images changed: %d)", a.Kind, a.Path, destination, len(changed))
+				} else if len(a.Entry.managedEmbeds) > 0 {
+					print("%s %s -> %s (draw.io embeds preserved)", a.Kind, a.Path, destination)
 				} else {
 					print("%s %s -> %s (images unchanged: %d; not uploaded)", a.Kind, a.Path, destination, len(a.File.Images))
 				}
@@ -661,19 +696,6 @@ func printPlan(p Plan, print func(string, ...any)) {
 				print("%s %s -> %s (images replaced: %d)", a.Kind, a.Path, destination, len(a.File.Images))
 			default:
 				print("%s %s -> %s", a.Kind, a.Path, destination)
-			}
-			checkAnchors := false
-			for _, ref := range a.File.Anchors {
-				if ref.Token != "" || ref.Reason == "target is not synchronized yet" && plannedTargets[ref.Target] {
-					checkAnchors = true
-					continue
-				}
-				if ref.Reason != "" {
-					print("warning %s: anchor %s#%s: %s; unresolved links are kept as text", a.Path, ref.Target, ref.Fragment, ref.Reason)
-				}
-			}
-			if checkAnchors {
-				print("check heading links %s (may update Notion after content sync)", a.Path)
 			}
 		}
 	}
@@ -687,51 +709,46 @@ func makeTitle(name string) map[string]any {
 }
 func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, print func(string, ...any)) error {
 	skipped := map[string]bool{}
-	anchorSkipped := map[string]bool{}
 	appendOnly := map[string]string{}
+	preservedDrawio := map[string][]drawioTextUpdate{}
 	for _, action := range p.Actions {
 		if c.Sync.DrawioEmbed && action.Kind == "update" && len(action.Entry.managedEmbeds) > 0 {
 			m, err := getMarkdown(ctx, api, action.Entry.PageID)
 			if err != nil {
 				return err
 			}
-			_, filled, err := normalizeManagedEmbeds(ctx, api, action.Entry, m.Markdown)
+			_, _, err = normalizeManagedEmbeds(ctx, api, action.Entry, m.Markdown)
 			if err != nil {
 				return err
 			}
-			if filled {
-				addition, err := appendedDrawioText(ctx, api, action.Entry, action.File, m.Markdown)
-				if err != nil {
-					return err
-				}
-				if addition != "" {
-					appendOnly[action.Key] = addition
-					continue
-				}
-				skipped[action.Key] = true
+			updates, safe, err := drawioTextUpdates(ctx, api, action, m.Markdown)
+			if err != nil {
+				return fmt.Errorf("%s: %w", action.Path, err)
+			}
+			if safe {
+				preservedDrawio[action.Key] = updates
 				continue
 			}
+			addition, err := appendedDrawioText(ctx, api, action.Entry, action.File, m.Markdown)
+			if err != nil {
+				return err
+			}
+			if addition != "" {
+				appendOnly[action.Key] = addition
+				continue
+			}
+			skipped[action.Key] = true
+			continue
 		}
 		if action.Kind == "update" && len(action.Entry.ImageHashes) > len(action.File.Images) {
 			return fmt.Errorf("%s: removing local images from an existing page is not supported", action.Path)
 		}
 	}
-	if len(skipped) > 0 {
-		for name, doc := range s.Documents {
-			if len(headingReferenceTargets(doc.SyncBody, name)) == 0 {
-				continue
-			}
-			for _, action := range p.Actions {
-				if strings.HasPrefix(action.Key, "file:") && !skipped[action.Key] && action.Kind != "unchanged" {
-					skipped[action.Key] = true
-					anchorSkipped[action.Key] = true
-				}
-			}
-			break
-		}
-	}
 	for _, action := range p.Actions {
 		if skipped[action.Key] {
+			continue
+		}
+		if _, ok := preservedDrawio[action.Key]; ok {
 			continue
 		}
 		if len(action.File.Images) > 0 && (action.Kind == "create" || action.Kind == "update" || action.Kind == "images-update") {
@@ -763,16 +780,7 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 				s.Skipped = map[string]bool{}
 			}
 			s.Skipped[a.Path] = true
-			if anchorSkipped[a.Key] {
-				print("warning %s: page not synchronized because a manual update prevents safe heading link updates", a.Path)
-				continue
-			}
-			print("warning %s: page not synchronized to protect manually populated draw.io embeds; update the page manually", a.Path)
-			for _, img := range a.File.Images {
-				if isDrawioSVG(img) {
-					print("warning %s: copy the draw.io viewer URL from %s", a.Path, drawioOutputPath(c, img))
-				}
-			}
+			print("warning %s: page not synchronized because existing draw.io embeds cannot be preserved safely; update the page manually", a.Path)
 			continue
 		}
 		if strings.HasPrefix(a.Key, "file:") {
@@ -783,6 +791,74 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 			if err := verifyFileUnchanged(c, f); err != nil {
 				return err
 			}
+		}
+		if planned, ok := preservedDrawio[a.Key]; ok {
+			e := a.Entry
+			before, err := validateExisting(ctx, api, e)
+			if err != nil {
+				return fmt.Errorf("%s: %w", a.Path, err)
+			}
+			current, safe, err := drawioTextUpdates(ctx, api, a, before.Markdown)
+			if err != nil || !safe || !reflect.DeepEqual(current, planned) {
+				return fmt.Errorf("%s: page changed while preparing the draw.io-preserving update; inspect Notion before retrying", a.Path)
+			}
+			for _, update := range current {
+				if err := verifyFileUnchanged(c, s.Documents[a.Path]); err != nil {
+					return err
+				}
+				if strings.Count(before.Markdown, update.Old) != 1 {
+					return fmt.Errorf("%s: text changed during the draw.io-preserving update; inspect Notion before retrying", a.Path)
+				}
+				if update.Range != "" {
+					selection, ok := drawioTextRange(before.Markdown, update.Old)
+					if !ok || selection != update.Range {
+						return fmt.Errorf("%s: text boundaries changed during the draw.io-preserving update; inspect Notion before retrying", a.Path)
+					}
+				}
+				segment := len(embedMarkdown.FindAllStringIndex(before.Markdown[:strings.Index(before.Markdown, update.Old)], -1))
+				previousSegments := embedMarkdown.Split(before.Markdown, -1)
+				body := map[string]any{"type": "update_content", "update_content": map[string]any{"content_updates": []any{map[string]any{"old_str": update.Old, "new_str": update.New}}}}
+				if update.Range != "" {
+					body = map[string]any{"type": "replace_content_range", "replace_content_range": map[string]any{"content_range": update.Range, "content": update.New}}
+				}
+				var updated markdown
+				if err := api.API(ctx, "PATCH", "v1/pages/"+e.PageID+"/markdown", body, &updated); err != nil {
+					return fmt.Errorf("%s: text update outcome uncertain; inspect Notion before retry: %w", a.Path, err)
+				}
+				if issue := markdownUpdateIssue(updated, e.PageID); issue != "" {
+					return fmt.Errorf("%s: text update returned warnings or incomplete content: %s; the update may be partially applied, inspect Notion before retrying", a.Path, issue)
+				}
+				after, err := getMarkdown(ctx, api, e.PageID)
+				if err != nil {
+					return fmt.Errorf("%s: text updated but readback failed; inspect Notion: %w", a.Path, err)
+				}
+				if _, _, err := normalizeManagedEmbeds(ctx, api, e, after.Markdown); err != nil {
+					return fmt.Errorf("%s: text updated but embed readback failed; inspect Notion: %w", a.Path, err)
+				}
+				afterSegments := embedMarkdown.Split(after.Markdown, -1)
+				if len(afterSegments) != len(previousSegments) {
+					return fmt.Errorf("%s: embed layout changed during text update; inspect Notion", a.Path)
+				}
+				for i := range afterSegments {
+					if i != segment && strings.TrimSpace(afterSegments[i]) != strings.TrimSpace(previousSegments[i]) {
+						return fmt.Errorf("%s: other content changed during text update; inspect Notion", a.Path)
+					}
+				}
+				before = after
+			}
+			normalized, _, err := normalizeManagedEmbeds(ctx, api, e, before.Markdown)
+			if err != nil {
+				return fmt.Errorf("%s: text updated but embed readback failed; inspect Notion: %w", a.Path, err)
+			}
+			e.LocalHash = a.File.Hash
+			e.RemoteHash = remoteMarkdownHash(normalized)
+			e.ImageHashes = imageHashesPreservingDrawio(a.File.Images, e)
+			s.Entries[a.Key] = e
+			if err := saveState(c, *s); err != nil {
+				return err
+			}
+			print("updated %s -> %s (draw.io embeds preserved)", a.Path, pageURL(e.PageID))
+			continue
 		}
 		if addition := appendOnly[a.Key]; addition != "" {
 			e := a.Entry
@@ -799,8 +875,8 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 			if err := api.API(ctx, "PATCH", "v1/pages/"+e.PageID+"/markdown", body, &inserted); err != nil {
 				return fmt.Errorf("%s: text append outcome uncertain; inspect Notion before retry: %w", a.Path, err)
 			}
-			if inserted.Object != "page_markdown" || norm(inserted.ID) != norm(e.PageID) || inserted.Truncated == nil || *inserted.Truncated || len(inserted.Unknown) > 0 || len(inserted.Warnings) > 0 {
-				return fmt.Errorf("%s: text append returned warnings or incomplete content; inspect Notion", a.Path)
+			if issue := markdownUpdateIssue(inserted, e.PageID); issue != "" {
+				return fmt.Errorf("%s: text append returned warnings or incomplete content: %s; inspect Notion before retrying", a.Path, issue)
 			}
 			after, err := getMarkdown(ctx, api, e.PageID)
 			if err != nil {
@@ -933,8 +1009,8 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 			if err := api.API(ctx, "PATCH", "v1/pages/"+e.PageID+"/markdown", body, &updated); err != nil {
 				return fmt.Errorf("%s: update failed or outcome uncertain; recheck Notion before retry: %w", a.Path, err)
 			}
-			if updated.Object != "page_markdown" || norm(updated.ID) != norm(e.PageID) || updated.Truncated == nil || *updated.Truncated || len(updated.Unknown) > 0 || len(updated.Warnings) > 0 {
-				return fmt.Errorf("%s: update returned warnings or incomplete content; inspect Notion", a.Path)
+			if issue := markdownUpdateIssue(updated, e.PageID); issue != "" {
+				return fmt.Errorf("%s: update returned warnings or incomplete content: %s; inspect Notion before retrying", a.Path, issue)
 			}
 			if len(a.File.Images) > 0 {
 				// replace_content rebuilds the page body, including its image blocks.
@@ -1005,7 +1081,7 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 	}
 	if !apply {
 		if c.Sync.DrawioEmbed {
-			print("draw.io SVGs: export viewer URLs to .notion-sync/ and create empty embed blocks when synced")
+			print("draw.io SVGs: new embeds export viewer URLs to .notion-sync/; existing embeds are preserved")
 		}
 		return nil
 	}
@@ -1041,11 +1117,7 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 	if err := Apply(ctx, c, api, &s, p, print); err != nil {
 		return err
 	}
-	if len(s.Skipped) > 0 {
-		print("warning: heading link synchronization skipped because some pages require manual updates")
-		return nil
-	}
-	return finishAnchorSync(ctx, c, api, &s, files, print, overwrite...)
+	return finishLinkSync(ctx, c, api, &s, files, print, overwrite...)
 }
 
 // RunFile limits synchronization to one scanned file; other state entries are retained.
@@ -1123,47 +1195,6 @@ func RunFile(ctx context.Context, c config.Config, api Client, filename string, 
 		return err
 	}
 	p.Deleted = nil
-	for target := range headingReferenceTargets(s.Documents[rel].SyncBody, rel) {
-		if target == rel {
-			continue
-		}
-		if _, ok := s.Entries["file:"+target]; !ok {
-			continue
-		}
-		if _, err := validateAnchorTarget(ctx, c, api, &s, target); err != nil {
-			return err
-		}
-	}
-	// Rebuilding a page changes its heading block IDs. A single-file sync must
-	// not leave links in other synchronized files pointing to the old IDs.
-	for _, action := range p.Actions {
-		if action.Key != "file:"+rel || action.Kind != "update" && action.Kind != "create" {
-			continue
-		}
-		for name, doc := range s.Documents {
-			if name == rel {
-				continue
-			}
-			if _, ok := s.Entries["file:"+name]; !ok {
-				continue
-			}
-			if referencesHeading(doc.SyncBody, name, rel) {
-				return fmt.Errorf("%s: other synchronized files link to its headings; use directory sync to update them safely", rel)
-			}
-			other := []File{*doc}
-			prepareLinks(other, s, c.SourcePath)
-			entry := s.Entries["file:"+name]
-			if other[0].Hash != entry.LocalHash {
-				remote, err := validateExisting(ctx, api, entry)
-				if err != nil {
-					return fmt.Errorf("%s: %w", name, err)
-				}
-				if remoteReferencesAnchor(remote.Markdown, s.Entries["file:"+rel].PageID) {
-					return fmt.Errorf("%s: another synchronized page still links to its headings; use directory sync", rel)
-				}
-			}
-		}
-	}
 	printPlan(p, print)
 	if c.Sync.DrawioEmbed {
 		if err := exportDrawioURL(c, p, apply, print); err != nil {
@@ -1172,7 +1203,7 @@ func RunFile(ctx context.Context, c config.Config, api Client, filename string, 
 	}
 	if !apply {
 		if c.Sync.DrawioEmbed {
-			print("draw.io SVGs: export viewer URLs to .notion-sync/ and create empty embed blocks when synced")
+			print("draw.io SVGs: new embeds export viewer URLs to .notion-sync/; existing embeds are preserved")
 		}
 		return nil
 	}
@@ -1201,9 +1232,42 @@ func RunFile(ctx context.Context, c config.Config, api Client, filename string, 
 	if err := Apply(ctx, c, api, &s, p, print); err != nil {
 		return err
 	}
-	if len(s.Skipped) > 0 {
-		print("warning: heading link synchronization skipped because the page requires a manual update")
+	return finishLinkSync(ctx, c, api, &s, selected, print, overwrite...)
+}
+
+// Newly adopted pages can provide IDs for links prepared earlier in the run.
+func finishLinkSync(ctx context.Context, c config.Config, api Client, s *State, files []File, print func(string, ...any), overwrite ...bool) error {
+	refresh := func() []File {
+		ready := make([]File, 0, len(files))
+		for _, f := range files {
+			if !s.Skipped[f.Path] {
+				ready = append(ready, *s.Documents[f.Path])
+			}
+		}
+		prepareLinks(ready, *s, c.SourcePath)
+		return ready
+	}
+	ready := refresh()
+	needsUpdate := false
+	for _, f := range ready {
+		if e, ok := s.Entries["file:"+f.Path]; ok && f.Hash != e.LocalHash {
+			needsUpdate = true
+		}
+	}
+	if !needsUpdate {
 		return nil
 	}
-	return finishAnchorSync(ctx, c, api, &s, selected, print, overwrite...)
+	plan, err := Build(ctx, c, api, ready, *s, overwrite...)
+	if err != nil {
+		return err
+	}
+	if err := Apply(ctx, c, api, s, plan, print); err != nil {
+		return err
+	}
+	for _, f := range refresh() {
+		if e, ok := s.Entries["file:"+f.Path]; ok && f.Hash != e.LocalHash {
+			return fmt.Errorf("%s: link dependencies changed during sync; retry", f.Path)
+		}
+	}
+	return nil
 }

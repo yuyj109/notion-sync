@@ -43,7 +43,7 @@ func transformManagedEmbeds(ctx context.Context, api Client, entry Entry, body s
 	found := map[string]bool{}
 	for _, child := range children.Results {
 		id := norm(child.ID)
-		if entry.managedEmbeds[id] {
+		if entry.managedEmbeds[id] && child.Type == "embed" {
 			found[id] = true
 		}
 		if child.Type == "embed" {
@@ -96,10 +96,122 @@ func drawioDiffMarkdown(ctx context.Context, api Client, entry Entry, f File, re
 	return result, err
 }
 
+type drawioTextUpdate struct{ Old, New, Range string }
+
+// drawioTextRange identifies a single region without including an embed in
+// either boundary. Complete boundary lines must be unique on the whole page.
+func drawioTextRange(remote, old string) (string, bool) {
+	lines := strings.Split(old, "\n")
+	if len(lines) < 2 {
+		return "", false
+	}
+	findUnique := func(fromStart bool) string {
+		for n := 1; n <= len(lines) && n <= 12; n++ {
+			var candidate string
+			if fromStart {
+				candidate = strings.Join(lines[:n], "\n")
+			} else {
+				candidate = strings.Join(lines[len(lines)-n:], "\n")
+			}
+			if len(candidate) > 1000 {
+				break
+			}
+			if strings.TrimSpace(candidate) != "" && !strings.Contains(candidate, "...") && strings.Count(remote, candidate) == 1 {
+				return candidate
+			}
+		}
+		return ""
+	}
+	start, end := findUnique(true), findUnique(false)
+	if start == "" || end == "" || len(start)+len(end) > len(old) {
+		return "", false
+	}
+	return start + "..." + end, true
+}
+
+// drawioTextUpdates replaces text between existing embeds without including an
+// embed in any Markdown operation. Ambiguous layouts fall back to manual sync.
+func drawioTextUpdates(ctx context.Context, api Client, a Action, remote string) ([]drawioTextUpdate, bool, error) {
+	if len(a.File.Images) == 0 || len(a.File.Images) != len(a.Entry.managedEmbeds) || len(a.TextParts) != len(a.File.Images)+1 {
+		return nil, false, nil
+	}
+	var children struct {
+		Results []struct {
+			ID   string `json:"id"`
+			Type string `json:"type"`
+		} `json:"results"`
+		HasMore bool `json:"has_more"`
+	}
+	if err := api.API(ctx, "GET", "v1/blocks/"+a.Entry.PageID+"/children?page_size=100", nil, &children); err != nil {
+		return nil, false, fmt.Errorf("cannot inspect draw.io embed blocks: %w", err)
+	}
+	if children.HasMore {
+		return nil, false, nil
+	}
+	var ids []string
+	for _, child := range children.Results {
+		if child.Type == "embed" {
+			ids = append(ids, norm(child.ID))
+		}
+	}
+	matches := embedMarkdown.FindAllStringIndex(remote, -1)
+	if len(ids) != len(a.File.Images) || len(matches) != len(ids) {
+		return nil, false, nil
+	}
+	for i, image := range a.File.Images {
+		id := norm(a.Entry.ImageBlocks[imageStateKey(image)])
+		if !isDrawioSVG(image) || id != ids[i] || !a.Entry.managedEmbeds[id] {
+			return nil, false, nil
+		}
+	}
+	var updates []drawioTextUpdate
+	start := 0
+	for i := range a.TextParts {
+		end := len(remote)
+		if i < len(matches) {
+			end = matches[i][0]
+		}
+		old, next := strings.TrimSpace(remote[start:end]), strings.TrimSpace(a.TextParts[i])
+		if old != next {
+			if old == "" || strings.Contains(next, "<embed") || remoteImageRE.MatchString(old) {
+				return nil, false, nil
+			}
+			update := drawioTextUpdate{Old: old, New: next}
+			// Large regions can contain serialized Notion tables and other blocks
+			// that do not match as one update_content string. Match only their
+			// unique outer boundaries instead.
+			if len(old) > 2000 || strings.Contains(old, "<table") {
+				var ok bool
+				update.Range, ok = drawioTextRange(remote, old)
+				if !ok {
+					return nil, false, nil
+				}
+			}
+			updates = append(updates, update)
+		}
+		if i < len(matches) {
+			start = matches[i][1]
+		}
+	}
+	// The API requires every old string to match exactly once, including after
+	// earlier replacements in the same request have been applied.
+	current := remote
+	for _, update := range updates {
+		if strings.Count(current, update.Old) != 1 {
+			return nil, false, nil
+		}
+		current = strings.Replace(current, update.Old, update.New, 1)
+	}
+	if len(updates) > 100 {
+		return nil, false, nil
+	}
+	return updates, true, nil
+}
+
 // appendedDrawioText identifies a safe end-of-page append without rebuilding
 // or changing the existing image and embed blocks.
 func appendedDrawioText(ctx context.Context, api Client, entry Entry, f File, remote string) (string, error) {
-	if len(f.Images) == 0 || !isDrawioSVG(f.Images[len(f.Images)-1]) || len(changedImages(f.Images, entry.ImageHashes)) != 0 {
+	if len(f.Images) == 0 || !isDrawioSVG(f.Images[len(f.Images)-1]) || len(changedUnmanagedImages(f.Images, entry)) != 0 {
 		return "", nil
 	}
 	remote, err := drawioDiffMarkdown(ctx, api, entry, f, remote)
@@ -155,10 +267,6 @@ func hasDrawioSVG(images []Image) bool {
 	return false
 }
 
-func drawioOutputPath(c config.Config, image Image) string {
-	return filepath.Join(c.WorkDir, ".notion-sync", image.Name+".txt")
-}
-
 func trackDrawioEmbeds(entry *Entry, images []Image) {
 	entry.managedEmbeds = make(map[string]bool)
 	for _, image := range images {
@@ -166,6 +274,92 @@ func trackDrawioEmbeds(entry *Entry, images []Image) {
 			entry.managedEmbeds[norm(entry.ImageBlocks[imageStateKey(image)])] = true
 		}
 	}
+}
+
+// Old metadata stores only an image hash and block ID. If the SVG has changed,
+// inspect the block to distinguish a managed embed from an ordinary image.
+func identifyManagedDrawioEmbeds(ctx context.Context, api Client, entry *Entry, images []Image) error {
+	trackDrawioEmbeds(entry, images)
+	unknown := map[string]bool{}
+	for _, image := range images {
+		id := norm(entry.ImageBlocks[imageStateKey(image)])
+		if !entry.managedEmbeds[id] {
+			continue
+		}
+		prior, ok := entry.ImageHashes[imageStateKey(image)]
+		if !ok {
+			prior = entry.ImageHashes[image.Path]
+		}
+		switch prior {
+		case image.Hash:
+			delete(entry.managedEmbeds, id)
+		case imageSyncHash(image):
+		default:
+			unknown[id] = true
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	var children struct {
+		Results []struct {
+			ID   string `json:"id"`
+			Type string `json:"type"`
+		} `json:"results"`
+		HasMore bool `json:"has_more"`
+	}
+	if err := api.API(ctx, "GET", "v1/blocks/"+entry.PageID+"/children?page_size=100", nil, &children); err != nil {
+		return fmt.Errorf("cannot inspect draw.io blocks: %w", err)
+	}
+	if children.HasMore {
+		return fmt.Errorf("cannot safely identify draw.io blocks on a paginated page")
+	}
+	for _, child := range children.Results {
+		id := norm(child.ID)
+		if !unknown[id] {
+			continue
+		}
+		switch child.Type {
+		case "embed":
+		case "image":
+			delete(entry.managedEmbeds, id)
+		default:
+			return fmt.Errorf("draw.io block %s has unexpected type %q", child.ID, child.Type)
+		}
+		delete(unknown, id)
+	}
+	if len(unknown) > 0 {
+		return fmt.Errorf("cannot identify existing draw.io blocks")
+	}
+	return nil
+}
+
+func changedUnmanagedImages(images []Image, entry Entry) []Image {
+	var changed []Image
+	for _, image := range changedImages(images, entry.ImageHashes) {
+		if isDrawioSVG(image) && entry.managedEmbeds[norm(entry.ImageBlocks[imageStateKey(image)])] {
+			continue
+		}
+		changed = append(changed, image)
+	}
+	return changed
+}
+
+func imageHashesPreservingDrawio(images []Image, entry Entry) map[string]string {
+	hashes := imageHashMap(images)
+	for _, image := range images {
+		key := imageStateKey(image)
+		if entry.managedEmbeds[norm(entry.ImageBlocks[key])] {
+			if prior, ok := entry.ImageHashes[key]; ok {
+				hashes[key] = prior
+			} else if prior, ok := entry.ImageHashes[image.Path]; ok {
+				hashes[key] = prior
+			} else {
+				delete(hashes, key)
+			}
+		}
+	}
+	return hashes
 }
 
 type drawioDiagram struct {
@@ -258,6 +452,9 @@ func exportDrawioURL(c config.Config, p Plan, write bool, print func(string, ...
 	for _, action := range p.Actions {
 		for _, image := range action.File.Images {
 			if !isDrawioSVG(image) {
+				continue
+			}
+			if action.Entry.managedEmbeds[norm(action.Entry.ImageBlocks[imageStateKey(image)])] {
 				continue
 			}
 			filename := filepath.Join(c.SourcePath, filepath.FromSlash(image.Path))

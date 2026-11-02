@@ -19,6 +19,13 @@ var diffPageID = regexp.MustCompile(`(?i)([0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[
 var diffNotionURL = regexp.MustCompile(`https://(?:www\.|app\.)?notion\.(?:so|com)/[^\s<>)]+`)
 var diffEnclosedAnchor = regexp.MustCompile(`\(<(https://notion\.so/[0-9a-f-]+\?notion-sync-anchor=[0-9a-f]{64})>(\s+"[^"]*")?\)`)
 
+// Keep legacy anchor URL normalization for readable diffs during migration.
+const anchorQuery = "notion-sync-anchor"
+
+func anchorPlaceholder(pageID, token string) string {
+	return pageURL(pageID) + "?" + anchorQuery + "=" + token
+}
+
 func normalizeAnchorURLs(body string, permitted map[string]bool) string {
 	body = diffNotionURL.ReplaceAllStringFunc(body, func(value string) string {
 		u, err := url.Parse(value)

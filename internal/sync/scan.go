@@ -28,7 +28,6 @@ type File struct {
 	SyncBody                                       string
 	Raw                                            []byte
 	Images                                         []Image
-	Anchors                                        []AnchorRef
 	Metadata                                       *Metadata
 	MetadataFormat                                 string
 	RootNeedsFormatting                            bool

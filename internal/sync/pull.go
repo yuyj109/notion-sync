@@ -185,10 +185,7 @@ func Pull(ctx context.Context, c config.Config, api Client, apply bool, print fu
 		if e.LocalHash == "" || e.RemoteHash == "" {
 			return fmt.Errorf("%s: incomplete synchronization baseline", f.Path)
 		}
-		comparisonFile, comparisonRemote, err := normalizePullAnchors(ctx, c, api, &s, f, m.Markdown)
-		if err != nil {
-			return fmt.Errorf("%s: %w", f.Path, err)
-		}
+		comparisonFile, comparisonRemote := f, m.Markdown
 		if f.Hash != e.LocalHash && !reflect.DeepEqual(pullKeys(diffLines(comparisonFile.SyncBody)), pullKeys(diffLines(comparisonRemote))) {
 			return fmt.Errorf("%s: local and Notion contents both changed; resolve manually", f.Path)
 		}

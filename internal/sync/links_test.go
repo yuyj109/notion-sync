@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -62,6 +63,132 @@ func TestExternalLocalLinksUseCommittedGitHubFiles(t *testing.T) {
 	}
 	if got := resolveLinks("[missing](../src/missing.md#section)", "doc.md", nil, nil, repo); got != `\[missing\](../src/missing.md#section)` {
 		t.Fatalf("unresolved anchor: %q", got)
+	}
+}
+
+func TestHeadingLinksBecomePageMentions(t *testing.T) {
+	selfID := "11111111-1111-1111-1111-111111111111"
+	otherID := "22222222-2222-2222-2222-222222222222"
+	docs := map[string]*File{"a.md": {PageID: selfID}, "b.md": {PageID: otherID}}
+	input := "[self](#missing) [other](./b.md#設定) [missing](./missing.md#x) `[code](./b.md#x)` [query](./b.md?q=1#x)"
+	want := `<mention-page url="` + pageURL(selfID) + `">self</mention-page> <mention-page url="` + pageURL(otherID) + `">other</mention-page> \[missing\](./missing.md#x) ` + "`[code](./b.md#x)`" + ` [query](./b.md?q=1#x)`
+	if got := resolveLinks(input, "a.md", docs, nil); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestPageSyncDoesNotValidateLinkedPage(t *testing.T) {
+	c, api, dir := setup(t)
+	a := filepath.Join(dir, "a.md")
+	write(t, a, "# A\n\n[section](./b.md#missing)\n")
+	write(t, filepath.Join(dir, "b.md"), "# B\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aID, bID := state.Entries["file:a.md"].PageID, state.Entries["file:b.md"].PageID
+	api.pages[norm(bID)].content = "# Edited in Notion"
+	write(t, a, strings.Replace(string(mustRead(t, a)), "# A\n", "# A changed\n", 1))
+	if err := RunFile(context.Background(), c, api, a, true, func(string, ...any) {}, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := api.pages[norm(aID)].content; !strings.Contains(got, `<mention-page url="`+pageURL(bID)+`">section</mention-page>`) {
+		t.Fatalf("missing page mention: %s", got)
+	}
+	if api.pages[norm(bID)].content != "# Edited in Notion" {
+		t.Fatal("linked page was modified")
+	}
+}
+
+func TestSyncMentionsNewPagesWithHeadingLinks(t *testing.T) {
+	c, api, dir := setup(t)
+	write(t, filepath.Join(dir, "a.md"), "# A\n\n[self](#a) [other](./b.md#missing)\n")
+	write(t, filepath.Join(dir, "b.md"), "# B\n\n[back](./a.md#a)\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b := state.Entries["file:a.md"].PageID, state.Entries["file:b.md"].PageID
+	contentA, contentB := api.pages[norm(a)].content, api.pages[norm(b)].content
+	if !strings.Contains(contentA, `<mention-page url="`+pageURL(a)+`">self</mention-page>`) || !strings.Contains(contentA, `<mention-page url="`+pageURL(b)+`">other</mention-page>`) || !strings.Contains(contentB, `<mention-page url="`+pageURL(a)+`">back</mention-page>`) {
+		t.Fatalf("new pages were not mentioned: a=%q b=%q", contentA, contentB)
+	}
+}
+
+func TestSyncMigratesExistingHeadingLinks(t *testing.T) {
+	c, api, dir := setup(t)
+	write(t, filepath.Join(dir, "a.md"), "# A\n\n[section](./b.md#b)\n")
+	write(t, filepath.Join(dir, "b.md"), "# B\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b := state.Entries["file:a.md"], state.Entries["file:b.md"]
+	legacy := "# A\n\n[section](" + pageURL(b.PageID) + "?notion-sync-anchor=" + strings.Repeat("a", 64) + "#" + strings.Repeat("b", 32) + ")\n"
+	api.pages[norm(a.PageID)].content = legacy
+	a.LocalHash = hash("legacy representation")
+	a.RemoteHash = remoteMarkdownHash(legacy)
+	state.Entries["file:a.md"] = a
+	state.Active["a.md"] = true
+	if err := saveState(c, state); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := api.pages[norm(a.PageID)].content; strings.Contains(got, "notion-sync-anchor") || !strings.Contains(got, `<mention-page url="`+pageURL(b.PageID)+`">section</mention-page>`) {
+		t.Fatalf("legacy link was not migrated: %s", got)
+	}
+}
+
+func TestSyncMentionsNewlyAdoptedPage(t *testing.T) {
+	c, api, dir := setup(t)
+	bID := "22222222-2222-2222-2222-222222222222"
+	api.pages[norm(bID)] = &fakePage{parent: rootID}
+	write(t, filepath.Join(dir, "a.md"), "# A\n\n[link](./b.md#heading)\n")
+	write(t, filepath.Join(dir, "b.md"), "---\nnotion-page-id: "+bID+"\n---\n# Heading\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := api.pages[norm(state.Entries["file:a.md"].PageID)].content
+	if !strings.Contains(got, `<mention-page url="`+pageURL(bID)+`">link</mention-page>`) {
+		t.Fatalf("adopted page not mentioned: %s", got)
+	}
+}
+
+func TestPullKeepsLocalHeadingLink(t *testing.T) {
+	c, api, dir := setup(t)
+	a := filepath.Join(dir, "a.md")
+	write(t, a, "# A\n\n[link](./b.md#section)\n")
+	write(t, filepath.Join(dir, "b.md"), "# B\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := api.pages[norm(state.Entries["file:a.md"].PageID)]
+	page.content += "\nRemote addition\n"
+	if err := Pull(context.Background(), c, api, true, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	got := string(mustRead(t, a))
+	if !strings.Contains(got, "[link](./b.md#section)") || !strings.Contains(got, "Remote addition") {
+		t.Fatalf("unexpected pulled content: %s", got)
 	}
 }
 

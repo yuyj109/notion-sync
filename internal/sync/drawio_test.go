@@ -142,6 +142,9 @@ func TestDrawioExportAndEmptyEmbed(t *testing.T) {
 	if err := os.WriteFile(output, []byte("user content"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	if err := exportDrawioURL(cfg, Plan{Actions: []Action{action}}, false, nil); err == nil {
+		t.Fatal("dry-run must detect collision")
+	}
 	if err := exportDrawioURL(cfg, Plan{Actions: []Action{action}}, true, nil); err == nil {
 		t.Fatal("expected collision error")
 	}
@@ -183,7 +186,11 @@ func TestDrawioViewerUsesCompressedModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := flate.NewReader(strings.NewReader(string(data)))
-	defer r.Close()
+	defer func() {
+		if err := r.Close(); err != nil {
+			t.Errorf("close compressed diagram: %v", err)
+		}
+	}()
 	compressed, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatal(err)
@@ -253,6 +260,60 @@ func TestDrawioModeSwitchPlansPageUpdate(t *testing.T) {
 	}
 	if len(plan.Actions) != 1 || plan.Actions[0].Kind != "update" {
 		t.Fatalf("expected page update when switching mode: %+v", plan.Actions)
+	}
+}
+
+func TestDisabledDrawioModeProtectsExistingEmbeds(t *testing.T) {
+	id := "11111111-1111-1111-1111-111111111111"
+	image := Image{Key: "image-1", Path: "diagram.drawio.svg", Hash: hash("diagram")}
+	entry := Entry{PageID: rootID, ImageHashes: map[string]string{image.Key: hash("drawio-embed:" + image.Hash)}, ImageBlocks: map[string]string{image.Key: id}}
+	client := &managedEmbedClient{children: []any{map[string]any{"id": id, "type": "embed"}}}
+	for _, images := range [][]Image{{image}, nil} {
+		if err := rejectDisabledManagedEmbeds(context.Background(), client, entry, images); err == nil || !strings.Contains(err.Error(), "--drawio-embed") {
+			t.Fatalf("expected embed protection with images %v: %v", images, err)
+		}
+	}
+	client.children = []any{map[string]any{"id": id, "type": "image"}}
+	if err := rejectDisabledManagedEmbeds(context.Background(), client, entry, []Image{image}); err != nil {
+		t.Fatalf("ordinary image should remain updatable: %v", err)
+	}
+}
+
+func TestReplacedDrawioReferencePreservesManagedEmbed(t *testing.T) {
+	id := "11111111-1111-1111-1111-111111111111"
+	baseline := "before\n<embed src=\"\"></embed>"
+	client := &managedEmbedClient{markdown: "before\n<embed src=\"https://viewer.diagrams.net/diagram\"></embed>", children: []any{map[string]any{"id": id, "type": "embed"}}}
+	image := Image{Key: "image-1", Name: "replacement.png", Path: "replacement.png", Hash: hash("png"), SourceLine: "![diagram](replacement.png)"}
+	file := File{Path: "guide.md", Body: "before\n![diagram](replacement.png)", SyncBody: "before\n![diagram](replacement.png)", Hash: hash("changed"), PageID: rootID, Images: []Image{image}}
+	entry := Entry{PageID: rootID, ParentID: rootID, ParentType: "page_id", Target: "hierarchy:", LocalHash: hash("old"), RemoteHash: remoteMarkdownHash(baseline), ImageHashes: map[string]string{"image-1": hash("drawio-embed:old")}, ImageBlocks: map[string]string{"image-1": id}}
+	state := State{Entries: map[string]Entry{"file:guide.md": entry}}
+	var cfg config.Config
+	cfg.Notion.ParentPageID = rootID
+	cfg.Sync.DrawioEmbed = true
+	plan, err := Build(context.Background(), cfg, client, []File{file}, state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skipped, _, _, err := inspectActions(context.Background(), cfg, client, plan)
+	if err != nil || !skipped["file:guide.md"] {
+		t.Fatalf("replacement must be skipped to preserve embed: skipped=%v err=%v", skipped, err)
+	}
+}
+
+func TestBuildRejectsDisabledDrawioEmbedEvenWithPush(t *testing.T) {
+	cfg, api, dir := setup(t)
+	write(t, filepath.Join(dir, "diagram.drawio.svg"), `<svg xmlns="http://www.w3.org/2000/svg"/>`)
+	write(t, filepath.Join(dir, "guide.md"), "# Guide\n![Diagram](diagram.drawio.svg)\n")
+	files, err := Scan(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "11111111-1111-1111-1111-111111111111"
+	entry := Entry{PageID: rootID, ParentID: rootID, ParentType: "page_id", Target: "hierarchy:", LocalHash: files[0].Hash, RemoteHash: hash("baseline"), ImageHashes: map[string]string{"image-1": hash("drawio-embed:" + files[0].Images[0].Hash)}, ImageBlocks: map[string]string{"image-1": id}}
+	state := State{Entries: map[string]Entry{"file:guide.md": entry}}
+	client := &embedAndPagesClient{fakeAPI: api, embedID: id}
+	if _, err := Build(context.Background(), cfg, client, files, state, true); err == nil || !strings.Contains(err.Error(), "--drawio-embed") {
+		t.Fatalf("expected embed protection before push: %v", err)
 	}
 }
 
@@ -343,6 +404,14 @@ func TestPageUpdateProtectsFilledManagedEmbed(t *testing.T) {
 	if !strings.Contains(joined, "page not synchronized") || !strings.Contains(joined, "cannot be preserved safely") {
 		t.Fatalf("missing manual instructions: %s", joined)
 	}
+	if err := skippedError(*state); err == nil || !strings.Contains(err.Error(), "page.md") {
+		t.Fatalf("expected partial failure: %v", err)
+	}
+	var preview []string
+	err = previewActions(context.Background(), cfg, client, Plan{Actions: []Action{{Kind: "update", Key: "file:page.md", Path: "page.md", Entry: entry, File: File{Images: []Image{image}}}}}, func(format string, args ...any) { preview = append(preview, fmt.Sprintf(format, args...)) })
+	if err == nil || !strings.Contains(strings.Join(preview, "\n"), "would be skipped") {
+		t.Fatalf("preview missed skip: %v %v", err, preview)
+	}
 }
 
 func TestUpdateTextAroundExistingDrawioEmbed(t *testing.T) {
@@ -382,6 +451,108 @@ func TestUpdateTextAroundExistingDrawioEmbed(t *testing.T) {
 	}
 	if len(state.Skipped) != 0 || state.Entries[action.Key].ImageBlocks["image-1"] != blockID || state.Entries[action.Key].ImageHashes["image-1"] != "old-hash" {
 		t.Fatalf("embed state not preserved: %+v", state.Entries[action.Key])
+	}
+}
+
+func TestDrawioUpdatePreservesMixedImages(t *testing.T) {
+	cfg, _, dir := setup(t)
+	cfg.Sync.DrawioEmbed = true
+	write(t, filepath.Join(dir, "home.md"), "# New heading\n\n![photo](photo.svg)\n\nNew middle\n\n![diagram](diagram.drawio.svg)\n\nNew end\n")
+	write(t, filepath.Join(dir, "photo.svg"), "photo")
+	write(t, filepath.Join(dir, "diagram.drawio.svg"), "diagram")
+	files, err := Scan(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := files[0]
+	parts, err := imageTextParts(file.SyncBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageID, embedID := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+	photo := "![photo](https://files.example/photo.svg?sig=x#notion_record=block." + imageID + ".space)"
+	embed := `<embed src="https://example.com/manual"></embed>`
+	remote := "# Old heading\n" + photo + "\nOld middle\n" + embed + "\nOld end"
+	client := &updatingEmbedClient{managedEmbedClient: &managedEmbedClient{markdown: remote, children: []any{map[string]any{"id": imageID, "type": "image"}, map[string]any{"id": embedID, "type": "embed"}}}}
+	entry := Entry{PageID: rootID, ParentID: rootID, ParentType: "page_id", RemoteHash: remoteMarkdownHash(strings.Replace(remote, "https://example.com/manual", "", 1)), ImageBlocks: map[string]string{"image-1": imageID, "image-2": embedID}, ImageHashes: map[string]string{"image-1": file.Images[0].Hash, "image-2": "old-hash"}, managedEmbeds: map[string]bool{norm(embedID): true}}
+	state, err := loadState(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Active["home.md"] = true
+	state.Entries["file:home.md"] = entry
+	action := Action{Kind: "update", Key: "file:home.md", Path: "home.md", Entry: entry, File: file, TextParts: parts}
+	if err := Apply(context.Background(), cfg, client, &state, Plan{Actions: []Action{action}}, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	want := "# New heading\n" + photo + "\nNew middle\n" + embed + "\nNew end"
+	if client.markdown != want || client.patches != 3 || len(state.Skipped) != 0 {
+		t.Fatalf("unexpected update: patches=%d markdown=%q skipped=%v", client.patches, client.markdown, state.Skipped)
+	}
+	file.Images[0].Hash = "changed"
+	action.File = file
+	if _, safe, err := drawioTextUpdates(context.Background(), client, action, client.markdown); err != nil || safe {
+		t.Fatalf("changed image must be rejected: safe=%v err=%v", safe, err)
+	}
+	file.Images[0].Hash = entry.ImageHashes["image-1"]
+	action.File = file
+	client.children[0] = map[string]any{"id": embedID, "type": "image"}
+	if _, safe, err := drawioTextUpdates(context.Background(), client, action, client.markdown); err != nil || safe {
+		t.Fatalf("unmatched image must be rejected: safe=%v err=%v", safe, err)
+	}
+}
+
+func TestMixedImageOnlyUpdateDoesNotReplaceChangedEmbed(t *testing.T) {
+	cfg, base, dir := setup(t)
+	cfg.Sync.DrawioEmbed = true
+	write(t, filepath.Join(dir, "home.md"), "![photo](photo.svg)\n\n![diagram](diagram.drawio.svg)\n")
+	write(t, filepath.Join(dir, "photo.svg"), "new photo")
+	write(t, filepath.Join(dir, "diagram.drawio.svg"), "new diagram")
+	state, err := loadState(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := *state.Documents["home.md"]
+	file.Images[1].StateHash = hash("drawio-embed:" + file.Images[1].Hash)
+	photoID, embedID := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+	oldURL, newURL := "https://files.example/old.svg", "https://files.example/new.svg"
+	base.pages[norm(rootID)].content = "![photo](" + oldURL + ")\n<embed src=\"https://example.com/manual\"></embed>"
+	base.imageFiles = map[string]imageBlock{norm(photoID): testImageBlock(photoID, oldURL, "old")}
+	base.nextImageURL = newURL
+	entry := Entry{PageID: rootID, ParentID: rootID, ParentType: "page_id", RemoteHash: remoteMarkdownHash(strings.Replace(base.pages[norm(rootID)].content, "https://example.com/manual", "", 1)), ImageBlocks: map[string]string{"image-1": photoID, "image-2": embedID}, ImageHashes: map[string]string{"image-1": "old photo", "image-2": "old diagram"}, managedEmbeds: map[string]bool{norm(embedID): true}}
+	state.Entries["file:home.md"] = entry
+	state.Active["home.md"] = true
+	client := &imageReadbackClient{fakeUploader: &fakeUploader{fakeAPI: base}, pageID: rootID, oldURL: oldURL, newURL: newURL, embedID: embedID}
+	action := Action{Kind: "images-update", Key: "file:home.md", Path: "home.md", Entry: entry, File: file}
+	if err := Apply(context.Background(), cfg, client, &state, Plan{Actions: []Action{action}}, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	if client.uploads != 1 || base.blockUpdates != 1 || state.Entries[action.Key].ImageHashes["image-2"] != "old diagram" {
+		t.Fatalf("embed must remain untouched: uploads=%d updates=%d state=%+v", client.uploads, base.blockUpdates, state.Entries[action.Key])
+	}
+}
+
+func TestReplaceEmbedsDoesNotForceOrdinaryPage(t *testing.T) {
+	cfg, api, dir := setup(t)
+	cfg.Sync.DrawioEmbed, cfg.Sync.ReplaceDrawioEmbeds = true, true
+	write(t, filepath.Join(dir, "home.md"), "updated\n")
+	files, err := Scan(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "11111111-1111-1111-1111-111111111111"
+	api.pages[norm(id)] = &fakePage{parent: rootID, parentType: "page_id", content: "old"}
+	state, err := loadState(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Entries["file:home.md"] = Entry{PageID: id, ParentID: rootID, ParentType: "page_id", Target: "hierarchy:", LocalHash: "old", RemoteHash: remoteMarkdownHash("old"), ImageHashes: map[string]string{"image-1": "old image"}}
+	plan, err := Build(context.Background(), cfg, api, files, state, true)
+	if err != nil || len(plan.Actions) != 1 || plan.Actions[0].ForceReplace {
+		t.Fatalf("ordinary page was forced: %+v, %v", plan, err)
+	}
+	if err := previewActions(context.Background(), cfg, api, plan, func(string, ...any) {}); err == nil || !strings.Contains(err.Error(), "removing local images") {
+		t.Fatalf("image removal accepted: %v", err)
 	}
 }
 
@@ -550,5 +721,362 @@ func TestSkippedEmbedPageDoesNotBlockOtherPages(t *testing.T) {
 	}
 	if !state.Skipped["home.md"] || state.Skipped["other.md"] || base.pages[norm(otherID)].content != "# New" {
 		t.Fatalf("unrelated page was blocked: skipped=%v content=%q", state.Skipped, base.pages[norm(otherID)].content)
+	}
+}
+
+func TestSkippedPageDoesNotExportURLOrBlockOtherUpdates(t *testing.T) {
+	cfg, base, dir := setup(t)
+	cfg.Sync.DrawioEmbed = true
+	diagram := `<svg xmlns="http://www.w3.org/2000/svg" content="&lt;mxfile&gt;&lt;diagram&gt;&lt;mxGraphModel&gt;&lt;root/&gt;&lt;/mxGraphModel&gt;&lt;/diagram&gt;&lt;/mxfile&gt;"/>`
+	write(t, filepath.Join(dir, "old.drawio.svg"), diagram)
+	write(t, filepath.Join(dir, "new.drawio.svg"), diagram)
+	home, other := filepath.Join(dir, "home.md"), filepath.Join(dir, "other.md")
+	write(t, home, "# Home\n\n![old](old.drawio.svg)\n")
+	write(t, other, "# Old\n")
+	state, err := loadState(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	homeID, otherID, embedID := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"
+	remote := "# Home\n<embed src=\"https://example.com/manual\"></embed>"
+	base.pages[norm(homeID)] = &fakePage{parent: rootID, parentType: "page_id", content: remote}
+	base.pages[norm(otherID)] = &fakePage{parent: rootID, parentType: "page_id", content: "# Old\n"}
+	state.Active["home.md"], state.Active["other.md"] = true, true
+	state.Entries["file:home.md"] = Entry{PageID: homeID, ParentID: rootID, ParentType: "page_id", Target: "hierarchy:", LocalHash: state.Documents["home.md"].Hash, RemoteHash: remoteMarkdownHash(strings.Replace(remote, "https://example.com/manual", "", 1)), ImageBlocks: map[string]string{"image-1": embedID}, ImageHashes: map[string]string{"image-1": hash("drawio-embed:" + hash(diagram))}}
+	state.Entries["file:other.md"] = Entry{PageID: otherID, ParentID: rootID, ParentType: "page_id", Target: "hierarchy:", LocalHash: state.Documents["other.md"].Hash, RemoteHash: remoteMarkdownHash("# Old\n")}
+	if err := saveState(cfg, state); err != nil {
+		t.Fatal(err)
+	}
+	write(t, home, string(mustRead(t, home))+"\n![new](new.drawio.svg)\n")
+	write(t, other, strings.Replace(string(mustRead(t, other)), "# Old\n", "# New\n", 1))
+	output := filepath.Join(cfg.WorkDir, ".notion-sync", "new.drawio.svg.txt")
+	write(t, output, "do not overwrite")
+	client := &embedAndPagesClient{fakeAPI: base, embedID: embedID}
+	for _, apply := range []bool{false, true} {
+		err := Run(context.Background(), cfg, client, apply, func(string, ...any) {})
+		if err == nil || !strings.Contains(err.Error(), "skipped") {
+			t.Fatalf("apply=%v: expected skipped page, got %v", apply, err)
+		}
+	}
+	if base.pages[norm(otherID)].content != "# New\n" || string(mustRead(t, output)) != "do not overwrite" {
+		t.Fatalf("other page or output wrong: %q %q", base.pages[norm(otherID)].content, mustRead(t, output))
+	}
+}
+
+type forceReplaceEmbedClient struct{ *fakeUploader }
+
+type linkPreviewClient struct {
+	*forceReplaceEmbedClient
+	embedID string
+}
+
+func (c *linkPreviewClient) API(ctx context.Context, method, endpoint string, body any, out any) error {
+	if method == "GET" && strings.HasSuffix(endpoint, "/children?page_size=100") {
+		data, _ := json.Marshal(map[string]any{"results": []any{map[string]any{"id": c.embedID, "type": "embed"}}, "has_more": false})
+		return json.Unmarshal(data, out)
+	}
+	return c.forceReplaceEmbedClient.API(ctx, method, endpoint, body, out)
+}
+
+type imageReadbackClient struct {
+	*fakeUploader
+	pageID, oldURL, newURL, embedID string
+	addText, stale, concurrentBlock bool
+}
+
+func (c *imageReadbackClient) API(ctx context.Context, method, endpoint string, body any, out any) error {
+	if c.embedID != "" && method == "GET" && strings.Contains(endpoint, "/children") {
+		data, _ := json.Marshal(map[string]any{"results": []any{map[string]any{"id": c.embedID, "type": "embed"}}, "has_more": false})
+		return json.Unmarshal(data, out)
+	}
+	if err := c.fakeUploader.API(ctx, method, endpoint, body, out); err != nil {
+		return err
+	}
+	if method == "PATCH" && strings.HasPrefix(endpoint, "v1/blocks/") && !strings.HasSuffix(endpoint, "/children") {
+		p := c.pages[norm(c.pageID)]
+		if !c.stale {
+			p.content = strings.Replace(p.content, c.oldURL, c.newURL, 1)
+		}
+		if c.addText {
+			p.content += "\nconcurrent change"
+		}
+		if c.concurrentBlock {
+			id := strings.TrimPrefix(endpoint, "v1/blocks/")
+			c.imageFiles[norm(id)] = testImageBlock(id, "https://files.example/other.svg", "concurrent")
+		}
+	}
+	return nil
+}
+
+func TestImageUpdateReadbackRebaselinesAndDetectsOtherEdits(t *testing.T) {
+	for _, tc := range []struct {
+		name                                                                             string
+		fragment, concurrent, stale, blockChange, unchangedBlock, alternateURL, wrongRef bool
+		want                                                                             string
+	}{
+		{name: "with fragment", fragment: true},
+		{name: "without fragment"},
+		{name: "different URL with block ID", fragment: true, alternateURL: true},
+		{name: "unrelated edit", concurrent: true, want: "other page content changed"},
+		{name: "stale markdown", stale: true, want: "cannot be verified in Markdown"},
+		{name: "same block changed", blockChange: true, want: "changed or could not be verified"},
+		{name: "update returned old file", unchangedBlock: true, want: "does not identify a new file"},
+		{name: "wrong URL after update", fragment: true, wrongRef: true, want: "cannot be verified in Markdown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, base, dir := setup(t)
+			write(t, filepath.Join(dir, "home.md"), "![photo](photo.svg)\n")
+			write(t, filepath.Join(dir, "photo.svg"), "new")
+			state, err := loadState(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			file := *state.Documents["home.md"]
+			blockID := "11111111-1111-1111-1111-111111111111"
+			oldURL := "https://files.example/old.svg"
+			newURL := "https://files.example/new.svg"
+			blockOld, blockNew := oldURL, newURL
+			if tc.alternateURL {
+				blockOld, blockNew = "https://storage.example/old.svg", "https://storage.example/new.svg"
+				oldURL = "https://www.notion.so/image/" + url.PathEscape(blockOld)
+				newURL = "https://www.notion.so/image/" + url.PathEscape(blockNew)
+			}
+			fragment := ""
+			if tc.fragment {
+				fragment = "#notion_record=block." + blockID + ".space"
+			}
+			base.pages[norm(rootID)].content = "![photo](" + oldURL + fragment + ")"
+			base.imageFiles = map[string]imageBlock{norm(blockID): testImageBlock(blockID, blockOld, "old")}
+			base.nextImageURL = blockNew
+			if tc.unchangedBlock {
+				base.nextImageURL = oldURL
+			}
+			entry := Entry{PageID: rootID, ParentID: rootID, ParentType: "page_id", RemoteHash: remoteMarkdownHash(base.pages[norm(rootID)].content), ImageBlocks: map[string]string{"image-1": blockID}, ImageHashes: map[string]string{"image-1": "old"}}
+			state.Entries["file:home.md"], state.Active["home.md"] = entry, true
+			readbackURL := newURL
+			if tc.wrongRef {
+				readbackURL = "https://cdn.example/wrong.svg"
+			}
+			client := &imageReadbackClient{fakeUploader: &fakeUploader{fakeAPI: base}, pageID: rootID, oldURL: oldURL, newURL: readbackURL, addText: tc.concurrent, stale: tc.stale, concurrentBlock: tc.blockChange}
+			a := Action{Kind: "images-update", Key: "file:home.md", Path: "home.md", Entry: entry, File: file}
+			err = Apply(context.Background(), cfg, client, &state, Plan{Actions: []Action{a}}, func(string, ...any) {})
+			if tc.want != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.want) || state.Entries[a.Key].RemoteHash != entry.RemoteHash || state.Entries[a.Key].ImageHashes["image-1"] != "old" {
+					t.Fatalf("concurrent edit accepted: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := validateExisting(context.Background(), client, state.Entries[a.Key]); err != nil {
+				t.Fatalf("updated image should not cause a conflict: %v", err)
+			}
+		})
+	}
+}
+
+func TestImageUpdateRejectsUnmatchedOrAmbiguousReferencesBeforeUpload(t *testing.T) {
+	for _, body := range []string{
+		"![photo](https://files.example/unrelated.svg)",
+		"![one](https://files.example/old.svg)\n![two](https://files.example/old.svg)",
+	} {
+		t.Run(body, func(t *testing.T) {
+			cfg, base, dir := setup(t)
+			write(t, filepath.Join(dir, "home.md"), "![photo](photo.svg)\n")
+			write(t, filepath.Join(dir, "photo.svg"), "new")
+			state, err := loadState(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			blockID := "11111111-1111-1111-1111-111111111111"
+			base.pages[norm(rootID)].content = body
+			base.imageFiles = map[string]imageBlock{norm(blockID): testImageBlock(blockID, "https://files.example/old.svg", "old")}
+			entry := Entry{PageID: rootID, ParentID: rootID, ParentType: "page_id", RemoteHash: remoteMarkdownHash(body), ImageBlocks: map[string]string{"image-1": blockID}, ImageHashes: map[string]string{"image-1": "old"}}
+			state.Entries["file:home.md"], state.Active["home.md"] = entry, true
+			client := &fakeUploader{fakeAPI: base}
+			a := Action{Kind: "images-update", Key: "file:home.md", Path: "home.md", Entry: entry, File: *state.Documents["home.md"]}
+			err = Apply(context.Background(), cfg, client, &state, Plan{Actions: []Action{a}}, func(string, ...any) {})
+			if err == nil || client.uploads != 0 || base.blockUpdates != 0 || state.Entries[a.Key].ImageHashes["image-1"] != "old" {
+				t.Fatalf("unsafe reference was updated: err=%v uploads=%d updates=%d", err, client.uploads, base.blockUpdates)
+			}
+		})
+	}
+}
+
+func TestImageUpdateRejectsUnverifiableProxyBeforeUpload(t *testing.T) {
+	for _, ref := range []string{"https://cdn.example/wrong", "https://cdn.example/by-block/11111111-1111-1111-1111-111111111111"} {
+		t.Run(ref, func(t *testing.T) {
+			cfg, base, dir := setup(t)
+			write(t, filepath.Join(dir, "home.md"), "![photo](photo.svg)\n")
+			write(t, filepath.Join(dir, "photo.svg"), "new")
+			state, err := loadState(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := "11111111-1111-1111-1111-111111111111"
+			base.pages[norm(rootID)].content = "![photo](" + ref + "#notion_record=block." + id + ")"
+			base.imageFiles = map[string]imageBlock{norm(id): testImageBlock(id, "https://storage.example/old", "old")}
+			entry := Entry{PageID: rootID, ParentID: rootID, ParentType: "page_id", RemoteHash: remoteMarkdownHash(base.pages[norm(rootID)].content), ImageBlocks: map[string]string{"image-1": id}, ImageHashes: map[string]string{"image-1": "old"}}
+			state.Entries["file:home.md"], state.Active["home.md"] = entry, true
+			client := &fakeUploader{fakeAPI: base}
+			a := Action{Kind: "images-update", Key: "file:home.md", Path: "home.md", Entry: entry, File: *state.Documents["home.md"]}
+			err = Apply(context.Background(), cfg, client, &state, Plan{Actions: []Action{a}}, func(string, ...any) {})
+			if err == nil || client.uploads != 0 || base.blockUpdates != 0 || state.Entries[a.Key].ImageHashes["image-1"] != "old" {
+				t.Fatalf("unverifiable proxy was updated: %v, uploads=%d", err, client.uploads)
+			}
+		})
+	}
+}
+
+func (c *forceReplaceEmbedClient) API(ctx context.Context, method, endpoint string, body any, out any) error {
+	if method == "PATCH" && strings.HasSuffix(endpoint, "/children") {
+		child := body.(map[string]any)["children"].([]any)[0].(map[string]any)
+		c.imageBlocks = append(c.imageBlocks, child)
+		b, _ := json.Marshal(map[string]any{"results": []any{map[string]any{"id": "33333333-3333-3333-3333-333333333333", "type": child["type"]}}})
+		return json.Unmarshal(b, out)
+	}
+	return c.fakeUploader.API(ctx, method, endpoint, body, out)
+}
+
+func TestPreviewAndApplyLinkDependentEmbedReplacement(t *testing.T) {
+	cfg, base, dir := setup(t)
+	cfg.Sync.DrawioEmbed, cfg.Sync.ReplaceDrawioEmbeds = true, true
+	diagram := `<svg xmlns="http://www.w3.org/2000/svg" content="&lt;mxfile&gt;&lt;diagram&gt;&lt;mxGraphModel&gt;&lt;root/&gt;&lt;/mxGraphModel&gt;&lt;/diagram&gt;&lt;/mxfile&gt;"/>`
+	write(t, filepath.Join(dir, "diagram.drawio.svg"), diagram)
+	write(t, filepath.Join(dir, "home.md"), "# Home\n\n[New](./new.md)\n\n![diagram](diagram.drawio.svg)\n")
+	write(t, filepath.Join(dir, "new.md"), "# New\n")
+	state, err := loadState(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	homeID, embedID := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+	remote := "# Home\n[New](./new.md)\n<embed src=\"https://example.com/manual\"></embed>"
+	base.pages[norm(homeID)] = &fakePage{parent: rootID, parentType: "page_id", content: remote}
+	state.Active["home.md"] = true
+	state.Entries["file:home.md"] = Entry{PageID: homeID, ParentID: rootID, ParentType: "page_id", Target: "hierarchy:", LocalHash: state.Documents["home.md"].Hash, RemoteHash: remoteMarkdownHash(strings.Replace(remote, "https://example.com/manual", "", 1)), ImageBlocks: map[string]string{"image-1": embedID}, ImageHashes: map[string]string{"image-1": hash("drawio-embed:" + hash(diagram))}}
+	if err := saveState(cfg, state); err != nil {
+		t.Fatal(err)
+	}
+	client := &linkPreviewClient{forceReplaceEmbedClient: &forceReplaceEmbedClient{fakeUploader: &fakeUploader{fakeAPI: base}}, embedID: embedID}
+	var preview strings.Builder
+	if err := Run(context.Background(), cfg, client, false, func(format string, args ...any) { fmt.Fprintf(&preview, format+"\n", args...) }, true); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(preview.String(), "new page links will change") || !strings.Contains(preview.String(), "embeds recreated empty") {
+		t.Fatalf("missing replacement preview: %s", preview.String())
+	}
+	if base.creates != 0 || base.updates != 0 {
+		t.Fatal("dry-run modified Notion")
+	}
+	output := filepath.Join(cfg.WorkDir, ".notion-sync", "diagram.drawio.svg.txt")
+	write(t, output, "user content")
+	for _, apply := range []bool{false, true} {
+		if err := Run(context.Background(), cfg, client, apply, func(string, ...any) {}, true); err == nil || !strings.Contains(err.Error(), "already exists with different content") {
+			t.Fatalf("apply=%v: expected output collision: %v", apply, err)
+		}
+	}
+	if base.creates != 0 || base.updates != 0 {
+		t.Fatal("output collision was detected after a Notion write")
+	}
+	if err := os.Remove(output); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(context.Background(), cfg, client, true, func(string, ...any) {}, true); err != nil {
+		t.Fatal(err)
+	}
+	if base.creates != 1 || !strings.Contains(base.pages[norm(homeID)].content, "<mention-page") {
+		t.Fatalf("link not synchronized: creates=%d content=%q", base.creates, base.pages[norm(homeID)].content)
+	}
+	if _, err := os.Stat(output); err != nil {
+		t.Fatalf("replacement URL missing: %v", err)
+	}
+}
+
+func TestReplaceEmbedsDetectsDiagramOnlyChange(t *testing.T) {
+	cfg, base, dir := setup(t)
+	cfg.Sync.DrawioEmbed = true
+	write(t, filepath.Join(dir, "home.md"), "# Home\n\n![diagram](diagram.drawio.svg)\n")
+	write(t, filepath.Join(dir, "diagram.drawio.svg"), "new diagram")
+	files, err := Scan(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadState(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	homeID, embedID := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+	remote := "# Home\n<embed src=\"https://example.com/manual\"></embed>"
+	base.pages[norm(homeID)] = &fakePage{parent: rootID, parentType: "page_id", content: remote}
+	state.Entries["file:home.md"] = Entry{PageID: homeID, ParentID: rootID, ParentType: "page_id", Target: "hierarchy:", LocalHash: files[0].Hash, RemoteHash: remoteMarkdownHash(strings.Replace(remote, "https://example.com/manual", "", 1)), ImageBlocks: map[string]string{"image-1": embedID}, ImageHashes: map[string]string{"image-1": hash("drawio-embed:" + hash("old diagram"))}}
+	client := &embedAndPagesClient{fakeAPI: base, embedID: embedID}
+	plan, err := Build(context.Background(), cfg, client, files, state, true)
+	if err != nil || plan.Actions[0].Kind != "unchanged" {
+		t.Fatalf("without replacement: %+v %v", plan, err)
+	}
+	cfg.Sync.ReplaceDrawioEmbeds = true
+	plan, err = Build(context.Background(), cfg, client, files, state, true)
+	if err != nil || !plan.Actions[0].ForceReplace {
+		t.Fatalf("diagram change not detected: %+v %v", plan, err)
+	}
+}
+
+func TestPushReplacesPageAndRecreatesEmptyDrawioEmbed(t *testing.T) {
+	cfg, api, dir := setup(t)
+	cfg.Sync.DrawioEmbed = true
+	cfg.Sync.ReplaceDrawioEmbeds = true
+	diagram := `<svg xmlns="http://www.w3.org/2000/svg" content="&lt;mxfile&gt;&lt;diagram&gt;&lt;mxGraphModel&gt;&lt;root/&gt;&lt;/mxGraphModel&gt;&lt;/diagram&gt;&lt;/mxfile&gt;"/>`
+	write(t, filepath.Join(dir, "diagram.drawio.svg"), diagram)
+	write(t, filepath.Join(dir, "home.md"), "# New\n\n![diagram](diagram.drawio.svg)\n\nNew body\n")
+	files, err := Scan(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := files[0]
+	id := "11111111-1111-1111-1111-111111111111"
+	embedID := "22222222-2222-2222-2222-222222222222"
+	remote := "# Old\n<embed src=\"https://example.com/manual\"></embed>\nOld body"
+	api.pages[norm(id)] = &fakePage{parent: rootID, parentType: "page_id", content: remote}
+	entry := Entry{PageID: id, ParentID: rootID, ParentType: "page_id", Target: "hierarchy:", LocalHash: "old-local", RemoteHash: remoteMarkdownHash(remote), ImageBlocks: map[string]string{"image-1": embedID}, ImageHashes: map[string]string{"image-1": hash("drawio-embed:" + file.Images[0].Hash)}}
+	state, err := loadState(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Entries["file:home.md"] = entry
+	state.Active["home.md"] = true
+	client := &forceReplaceEmbedClient{fakeUploader: &fakeUploader{fakeAPI: api}}
+	plan, err := Build(context.Background(), cfg, client, files, state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Actions) != 1 || !plan.Actions[0].ForceReplace {
+		t.Fatalf("missing forced replacement: %+v", plan.Actions)
+	}
+	cfg.Sync.ReplaceDrawioEmbeds = false
+	ordinaryPush, err := Build(context.Background(), cfg, client, files, state, true)
+	if err != nil || len(ordinaryPush.Actions) != 1 || ordinaryPush.Actions[0].ForceReplace {
+		t.Fatalf("ordinary push must preserve embeds: %+v, %v", ordinaryPush, err)
+	}
+	cfg.Sync.ReplaceDrawioEmbeds = true
+	var preview strings.Builder
+	printPlan(plan, func(format string, args ...any) { fmt.Fprintf(&preview, format, args...) })
+	if !strings.Contains(preview.String(), "embeds recreated empty") {
+		t.Fatalf("missing preview: %s", preview.String())
+	}
+	if err := exportDrawioURL(cfg, plan, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := Apply(context.Background(), cfg, client, &state, plan, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	if got := api.pages[norm(id)].content; strings.Contains(got, "Old") || strings.Contains(got, "manual") || !strings.Contains(got, "New body") {
+		t.Fatalf("page not replaced: %q", got)
+	}
+	if len(api.imageBlocks) != 1 || api.imageBlocks[0]["type"] != "embed" || api.imageBlocks[0]["embed"].(map[string]any)["url"] != "" {
+		t.Fatalf("embed not recreated empty: %+v", api.imageBlocks)
+	}
+	if state.Entries["file:home.md"].ImageBlocks["image-1"] != "33333333-3333-3333-3333-333333333333" {
+		t.Fatal("new block not saved")
 	}
 }

@@ -9,13 +9,14 @@ type Config struct {
 	Source string
 	Notion struct{ ParentID, ParentType, ParentPageID, ParentDatabaseID string }
 	Sync   struct {
-		Direction         string
-		MetadataFormat    string
-		PreserveHierarchy bool
-		Delete            bool
-		DrawioEmbed       bool
-		Include           []string
-		Exclude           []string
+		Direction           string
+		MetadataFormat      string
+		PreserveHierarchy   bool
+		Delete              bool
+		DrawioEmbed         bool
+		ReplaceDrawioEmbeds bool
+		Include             []string
+		Exclude             []string
 	}
 	WorkDir    string
 	SourcePath string

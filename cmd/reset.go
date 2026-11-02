@@ -15,7 +15,14 @@ func addResetCommand(root *cobra.Command) {
 		Long:  "Clear Notion destination and sync metadata from a Markdown file or all Markdown files under a directory. Does not change Notion. Pending creations must be resolved first.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return syncer.Reset(args[0], dryRun, func(format string, args ...any) { _, _ = fmt.Fprintf(cmd.OutOrStdout(), format+"\n", args...) })
+			for _, name := range []string{"include", "exclude"} {
+				if cmd.Root().PersistentFlags().Changed(name) {
+					return fmt.Errorf("--%s is not supported by reset; specify files or directories explicitly", name)
+				}
+			}
+			return withLockRecovery(cmd, func() error {
+				return syncer.Reset(args[0], dryRun, func(format string, args ...any) { _, _ = fmt.Fprintf(cmd.OutOrStdout(), format+"\n", args...) })
+			})
 		},
 	}
 	c.Flags().BoolVar(&dryRun, "dry-run", false, "show files to clear without modifying them")

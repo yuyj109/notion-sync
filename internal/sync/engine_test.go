@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,7 +16,10 @@ import (
 
 const rootID = "01234567-89ab-cdef-0123-456789abcdef"
 
-type fakePage struct{ parent, content, parentType string }
+type fakePage struct {
+	parent, content, parentType string
+	locked                      bool
+}
 type fakeAPI struct {
 	pages            map[string]*fakePage
 	creates, updates int
@@ -28,6 +32,9 @@ type fakeAPI struct {
 	onMarkdownGet    func()
 	titles           []string
 	imageBlocks      []map[string]any
+	imageFiles       map[string]imageBlock
+	nextImageURL     string
+	renderImages     bool
 	events           []string
 }
 
@@ -42,13 +49,41 @@ func (f *fakeAPI) API(_ context.Context, method, endpoint string, body any, out 
 	if method == "PATCH" && strings.Contains(endpoint, "/children") {
 		b := body.(map[string]any)
 		f.imageBlocks = append(f.imageBlocks, b["children"].([]any)[0].(map[string]any))
+		id := fmt.Sprintf("%032x", 999)
+		if f.imageFiles == nil {
+			f.imageFiles = map[string]imageBlock{}
+		}
+		f.imageFiles[norm(id)] = testImageBlock(id, "https://files.example/old.png", "old")
 		f.events = append(f.events, "image")
 		return copyResult(map[string]any{"results": []any{map[string]any{"id": fmt.Sprintf("%032x", 999), "type": "image"}}})
+	}
+	if method == "GET" && strings.HasPrefix(endpoint, "v1/blocks/") && strings.Contains(endpoint, "/children") {
+		var children []any
+		if len(f.imageBlocks) > 0 {
+			children = append(children, map[string]any{"id": fmt.Sprintf("%032x", 999), "type": "image"})
+		}
+		return copyResult(map[string]any{"results": children, "has_more": false})
 	}
 	if method == "PATCH" && strings.HasPrefix(endpoint, "v1/blocks/") {
 		f.blockUpdates++
 		f.blockUpdateBody = body.(map[string]any)
-		return copyResult(map[string]any{"object": "block", "id": strings.TrimPrefix(endpoint, "v1/blocks/"), "type": "image"})
+		id := strings.TrimPrefix(endpoint, "v1/blocks/")
+		newURL := f.nextImageURL
+		if newURL == "" {
+			newURL = fmt.Sprintf("https://files.example/new-%d.png", f.blockUpdates)
+		}
+		if f.imageFiles == nil {
+			f.imageFiles = map[string]imageBlock{}
+		}
+		block := testImageBlock(id, newURL, fmt.Sprintf("updated-%d", f.blockUpdates))
+		f.imageFiles[norm(id)] = block
+		return copyResult(block)
+	}
+	if method == "GET" && strings.HasPrefix(endpoint, "v1/blocks/") && !strings.Contains(endpoint, "/children") {
+		if b, ok := f.imageFiles[norm(strings.TrimPrefix(endpoint, "v1/blocks/"))]; ok {
+			return copyResult(b)
+		}
+		return errors.New("block not found")
 	}
 	if method == "POST" && endpoint == "v1/pages" {
 		f.creates++
@@ -88,7 +123,7 @@ func (f *fakeAPI) API(_ context.Context, method, endpoint string, body any, out 
 		if parentType == "" {
 			parentType = "page_id"
 		}
-		return copyResult(map[string]any{"object": "page", "id": id, "parent": map[string]any{"type": parentType, parentType: p.parent}})
+		return copyResult(map[string]any{"object": "page", "id": id, "is_locked": p.locked, "parent": map[string]any{"type": parentType, parentType: p.parent}})
 	}
 	if method == "PATCH" {
 		if f.failUpdate {
@@ -117,7 +152,19 @@ func (f *fakeAPI) API(_ context.Context, method, endpoint string, body any, out 
 	if isMarkdown && method == "GET" && f.onMarkdownGet != nil {
 		f.onMarkdownGet()
 	}
-	return copyResult(map[string]any{"object": "page_markdown", "id": id, "markdown": p.content, "truncated": false, "unknown_block_ids": []string{}})
+	content := p.content
+	if isMarkdown && f.renderImages && len(f.imageBlocks) > 0 {
+		block := f.imageFiles[norm(fmt.Sprintf("%032x", 999))]
+		content += "\n![Architecture](" + block.Image.File.URL + ")"
+	}
+	return copyResult(map[string]any{"object": "page_markdown", "id": id, "markdown": content, "truncated": false, "unknown_block_ids": []string{}})
+}
+
+func testImageBlock(id, rawURL, edited string) imageBlock {
+	var b imageBlock
+	b.Object, b.ID, b.Type, b.LastEditedTime = "block", id, "image", edited
+	b.Image.Type, b.Image.File.URL = "file", rawURL
+	return b
 }
 
 type fakeUploader struct {
@@ -390,6 +437,35 @@ func TestLifecycleAndConflict(t *testing.T) {
 	}
 }
 
+func TestSyncLockedPageStillChecksRemoteChanges(t *testing.T) {
+	c, api, dir := setup(t)
+	file := filepath.Join(dir, "a.md")
+	write(t, file, "original\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := api.pages[norm(s.Entries["file:a.md"].PageID)]
+	p.locked = true
+	write(t, file, strings.Replace(string(mustRead(t, file)), "original\n", "local update\n", 1))
+	if err := RunFile(context.Background(), c, api, file, true, func(string, ...any) {}); err != nil {
+		t.Fatalf("locked page blocked synchronization: %v", err)
+	}
+	if p.content != "local update\n" {
+		t.Fatalf("locked page was not updated: %q", p.content)
+	}
+	p.content = "Notion update\n"
+	if err := RunFile(context.Background(), c, api, file, true, func(string, ...any) {}); err == nil || !strings.Contains(err.Error(), "changed in Notion") {
+		t.Fatalf("expected conflict after Notion content changed: %v", err)
+	}
+	if p.content != "Notion update\n" {
+		t.Fatal("conflicting Notion content was overwritten")
+	}
+}
+
 func TestOverwriteRemoteChanges(t *testing.T) {
 	c, api, dir := setup(t)
 	write(t, filepath.Join(dir, "a.md"), "local\n")
@@ -562,6 +638,7 @@ func TestHTMLCommentsExcludedFromSync(t *testing.T) {
 
 func TestLocalImageScanAndCreate(t *testing.T) {
 	c, api, dir := setup(t)
+	api.renderImages = true
 	imgDir := filepath.Join(dir, "images")
 	if err := os.Mkdir(imgDir, 0700); err != nil {
 		t.Fatal(err)
@@ -764,6 +841,43 @@ func TestLocalImageRejectsOutsideSourceAndCodeFence(t *testing.T) {
 	}
 }
 
+func TestInlineLocalImageRejected(t *testing.T) {
+	dir := t.TempDir()
+	for _, body := range []string{"text ![x](missing.png)", "![x](missing.png) text", "- ![x](missing.png)"} {
+		if _, err := localImages(body, "guide.md", dir); err == nil || !strings.Contains(err.Error(), "standalone") {
+			t.Errorf("%q: expected standalone error, got %v", body, err)
+		}
+	}
+	for _, body := range []string{"text ![x](https://example.com/a.png)", "`![x](missing.png)`", "\\![x](missing.png)", "```md\ntext ![x](missing.png)\n```"} {
+		if _, err := localImages(body, "guide.md", dir); err != nil {
+			t.Errorf("%q: unexpected error: %v", body, err)
+		}
+	}
+}
+
+func TestLocalReferenceImagesRejected(t *testing.T) {
+	dir := t.TempDir()
+	for _, body := range []string{
+		"![diagram][ref]\n\n[ref]: images/a.png\n",
+		"![diagram][]\n\n[diagram]: images/a.png\n",
+		"![diagram]\n\n[diagram]: images/a.png\n",
+		"text ![diagram][ref]\n\n[ref]: images/a.png\n",
+	} {
+		if _, err := localImages(body, "guide.md", dir); err == nil || !strings.Contains(err.Error(), "standalone") {
+			t.Errorf("%q: expected standalone error, got %v", body, err)
+		}
+	}
+	for _, body := range []string{
+		"![diagram][ref]\n\n[ref]: https://example.com/a.png\n",
+		"`![diagram][ref]`\n\n[ref]: images/a.png\n",
+		"```md\n![diagram][ref]\n```\n\n[ref]: images/a.png\n",
+	} {
+		if _, err := localImages(body, "guide.md", dir); err != nil {
+			t.Errorf("%q: unexpected error: %v", body, err)
+		}
+	}
+}
+
 func TestLocalSVGImageUsesSVGContentType(t *testing.T) {
 	dir := t.TempDir()
 	dir, err := filepath.EvalSymlinks(dir)
@@ -790,6 +904,103 @@ func TestRemoteImageHashIgnoresExpiringSignature(t *testing.T) {
 	}
 	if a == remoteMarkdownHash("![image](<https://files.notion.so/other.png?signature=one>)") {
 		t.Fatal("different image path did not change hash")
+	}
+}
+
+func TestRemoteImageHashNormalizesNotionS3Signatures(t *testing.T) {
+	for _, base := range []string{
+		"https://s3.us-west-2.amazonaws.com/secure.notion-static.com/file.png",
+		"https://prod-files-secure.s3.us-west-2.amazonaws.com/file.png",
+	} {
+		a := "![x](" + base + "?X-Amz-Signature=one&X-Amz-Date=one&version=1)"
+		b := "![x](" + base + "?X-Amz-Signature=two&X-Amz-Date=two&version=1)"
+		c := "![x](" + base + "?X-Amz-Signature=two&X-Amz-Date=two&version=2)"
+		if remoteMarkdownHash(a) != remoteMarkdownHash(b) || remoteMarkdownHash(a) == remoteMarkdownHash(c) {
+			t.Fatalf("incorrect signature normalization for %s", base)
+		}
+	}
+	for _, base := range []string{"https://s3.us-west-2.amazonaws.com/other-bucket/file.png", "https://example.com/file.png"} {
+		if remoteMarkdownHash("![x]("+base+"?X-Amz-Signature=one)") == remoteMarkdownHash("![x]("+base+"?X-Amz-Signature=two)") {
+			t.Fatalf("ignored external signature for %s", base)
+		}
+	}
+}
+
+func TestRemoteImageHashNormalizesNotionS3SignatureV2(t *testing.T) {
+	base := "![x](https://s3.us-west-2.amazonaws.com/secure.notion-static.com/file.png?"
+	a := base + "Signature=one&Expires=1&AWSAccessKeyId=key1&versionId=1)"
+	b := base + "Signature=two&Expires=2&AWSAccessKeyId=key2&versionId=1)"
+	c := base + "Signature=two&Expires=2&AWSAccessKeyId=key2&versionId=2)"
+	if remoteMarkdownHash(a) != remoteMarkdownHash(b) || remoteMarkdownHash(a) == remoteMarkdownHash(c) {
+		t.Fatal("incorrect Signature V2 normalization")
+	}
+}
+
+func TestRemoteImageHashNormalizesProxySignatures(t *testing.T) {
+	proxy := func(base, signature, version string) string {
+		source := base + "?X-Amz-Signature=" + signature + "&versionId=" + version
+		return "![x](https://www.notion.so/image/" + url.PathEscape(source) + "?table=block)"
+	}
+	path := "https://s3.us-west-2.amazonaws.com/secure.notion-static.com/folder/file.png"
+	host := "https://secure.notion-static.com.s3.us-west-2.amazonaws.com/folder/file.png"
+	if remoteMarkdownHash(proxy(path, "old", "one")) != remoteMarkdownHash(proxy(host, "new", "one")) {
+		t.Fatal("same Notion image triggered a conflict")
+	}
+	if remoteMarkdownHash(proxy(path, "old", "one")) == remoteMarkdownHash(proxy(host, "new", "two")) {
+		t.Fatal("changed version ignored")
+	}
+	thirdParty := "https://example.com/file.png"
+	if remoteMarkdownHash(proxy(thirdParty, "old", "one")) == remoteMarkdownHash(proxy(thirdParty, "new", "one")) {
+		t.Fatal("external signature ignored")
+	}
+}
+
+func TestRemoteImageHashPreservesMeaningfulQueries(t *testing.T) {
+	for _, pair := range [][2]string{
+		{"![x](https://example.com/x.png?version=1)", "![x](https://example.com/x.png?version=2)"},
+		{"![x](https://files.notion.so/x.png?signature=a&version=1)", "![x](https://files.notion.so/x.png?signature=b&version=2)"},
+		{"`![x](https://files.notion.so/x.png?signature=a)`", "`![x](https://files.notion.so/x.png?signature=b)`"},
+		{"```\n![x](https://files.notion.so/x.png?signature=a)\n```", "```\n![x](https://files.notion.so/x.png?signature=b)\n```"},
+	} {
+		if remoteMarkdownHash(pair[0]) == remoteMarkdownHash(pair[1]) {
+			t.Fatalf("meaningful change ignored: %q", pair)
+		}
+	}
+}
+
+func TestOversizeImageRejectedBeforePageCreation(t *testing.T) {
+	c, api, dir := setup(t)
+	write(t, filepath.Join(dir, "a.md"), "![image](big.png)\n")
+	f, err := os.Create(filepath.Join(dir, "big.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(20*1024*1024 + 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, apply := range []bool{false, true} {
+		if err := run(c, api, apply); err == nil || !strings.Contains(err.Error(), "20 MB") {
+			t.Fatalf("apply=%v: %v", apply, err)
+		}
+		if err := RunFile(context.Background(), c, api, filepath.Join(dir, "a.md"), apply, func(string, ...any) {}); err == nil || !strings.Contains(err.Error(), "20 MB") {
+			t.Fatalf("single file apply=%v: %v", apply, err)
+		}
+		if api.creates != 0 {
+			t.Fatal("page created before image validation")
+		}
+	}
+}
+
+func TestPreviewRejectsImageRemoval(t *testing.T) {
+	action := Action{Kind: "update", Path: "a.md", Entry: Entry{ImageHashes: map[string]string{"image-1": "hash"}}}
+	for _, force := range []bool{false, true} {
+		action.ForceReplace = force
+		if err := previewActions(context.Background(), config.Config{}, nil, Plan{Actions: []Action{action}}, func(string, ...any) {}); err == nil || !strings.Contains(err.Error(), "removing local images") {
+			t.Fatalf("force=%v: expected image removal error: %v", force, err)
+		}
 	}
 }
 
@@ -1187,7 +1398,7 @@ func TestRecoverCommentPendingCreation(t *testing.T) {
 	}
 }
 
-func TestRecoverVerifiedImagePageRecordsSourceBaseline(t *testing.T) {
+func TestRecoverIncompleteImagePageRequiresSync(t *testing.T) {
 	c, api, dir := setup(t)
 	if err := os.Mkdir(filepath.Join(dir, "images"), 0700); err != nil {
 		t.Fatal(err)
@@ -1207,8 +1418,38 @@ func TestRecoverVerifiedImagePageRecordsSourceBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if f.Metadata.Entry == nil || f.Metadata.Entry.LocalHash != f.Hash || f.Metadata.Entry.ImageHashes["image-1"] != hash("image") {
+	if f.Metadata.Entry == nil || f.Metadata.Entry.LocalHash == f.Hash || len(f.Metadata.Entry.ImageHashes) != 0 {
 		t.Fatalf("recovered image baseline=%+v", f.Metadata.Entry)
+	}
+	if err := Run(context.Background(), c, &fakeUploader{fakeAPI: api}, true, func(string, ...any) {}); err != nil {
+		t.Fatalf("sync after recovery: %v", err)
+	}
+	if api.updates == 0 {
+		t.Fatal("incomplete recovered page was not updated")
+	}
+}
+
+func TestIndentedCodeImageIsNotUploaded(t *testing.T) {
+	body := "    ![example](missing.png)\n\n![real](real.png)\n"
+	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "real.png"), []byte("image"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	images, err := localImages(body, "a.md", dir)
+	if err != nil || len(images) != 1 || images[0].Path != "real.png" {
+		t.Fatalf("images=%v err=%v", images, err)
+	}
+	parts, err := imageTextParts(body)
+	if err != nil || len(parts) != 2 || !strings.Contains(parts[0], "    ![example](missing.png)") {
+		t.Fatalf("parts=%q err=%v", parts, err)
+	}
+	text, _, err := bodyWithoutImages(body)
+	if err != nil || !strings.Contains(text, "    ![example](missing.png)") {
+		t.Fatalf("text=%q err=%v", text, err)
 	}
 }
 

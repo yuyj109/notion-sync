@@ -8,6 +8,40 @@ import (
 	"testing"
 )
 
+func TestReplaceUnchangedFileRejectsConcurrentChanges(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		t.Run(map[bool]string{false: "modified", true: "replaced"}[replace], func(t *testing.T) {
+			dir := t.TempDir()
+			name, temporary := filepath.Join(dir, "file.md"), filepath.Join(dir, "temp")
+			write(t, name, "original")
+			info, err := os.Lstat(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			write(t, temporary, "generated")
+			if replace {
+				other := filepath.Join(dir, "other")
+				write(t, other, "original")
+				if err := os.Rename(other, name); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				write(t, name, "edited")
+			}
+			if err := replaceUnchangedFile(name, temporary, []byte("original"), info); err == nil {
+				t.Fatal("expected concurrent change error")
+			}
+			want := "edited"
+			if replace {
+				want = "original"
+			}
+			if got := string(mustRead(t, name)); got != want {
+				t.Fatalf("file overwritten: %q", got)
+			}
+		})
+	}
+}
+
 func TestResetAllowsCreatingAtNewDestination(t *testing.T) {
 	c, api, dir := setup(t)
 	file := filepath.Join(dir, "note.md")

@@ -16,7 +16,7 @@ func Recover(ctx context.Context, c config.Config, api Client, filename, pageID 
 	if pageID != "" && notCreated {
 		return "", fmt.Errorf("--page-id and --not-created cannot be combined")
 	}
-	unlock, err := lock(c)
+	unlock, err := lock()
 	if err != nil {
 		return "", err
 	}
@@ -42,7 +42,7 @@ func Recover(ctx context.Context, c config.Config, api Client, filename, pageID 
 	}
 	rel, err := filepath.Rel(root, resolved)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("file must be inside the source directory")
+		return "", fmt.Errorf("file must be inside the configured source %s; use --source to select its synchronization root", c.SourcePath)
 	}
 	rel = filepath.ToSlash(rel)
 	s, err := loadStateWithPending(c, true)
@@ -50,13 +50,23 @@ func Recover(ctx context.Context, c config.Config, api Client, filename, pageID 
 		return "", err
 	}
 	f := s.Documents[rel]
-	if f == nil || f.Metadata == nil || f.Metadata.Pending == nil {
+	if s.Pending == nil || s.PendingOwner != rel {
 		return "", fmt.Errorf("%s has no pending creation", rel)
 	}
-	pending := f.Metadata.Pending
-	if s.Pending == nil || s.Pending.Key != pending.Key {
-		return "", fmt.Errorf("pending metadata does not match")
+	if f == nil {
+		data, err := os.ReadFile(resolved)
+		if err != nil {
+			return "", err
+		}
+		parsed, err := parse(data)
+		if err != nil {
+			return "", err
+		}
+		parsed.Path = rel
+		f = &parsed
+		s.Documents[rel] = f
 	}
+	pending := s.Pending
 	if notCreated {
 		if pending.PageID != "" {
 			return "", fmt.Errorf("pending creation has a known page ID; use --page-id")
@@ -94,17 +104,10 @@ func Recover(ctx context.Context, c config.Config, api Client, filename, pageID 
 			return "", err
 		}
 		localHash := hash("recovery-pending:" + f.Hash)
-		imageHashes := map[string]string(nil)
-		if len(f.Images) > 0 && m.Markdown != "" {
-			// For image pages, recovery is an explicit user confirmation that the
-			// created page and its attachments match the local source. Record that
-			// baseline so the next sync does not replace or duplicate image blocks.
-			localHash = f.Hash
-			imageHashes = imageHashMap(f.Images)
-		} else if localHash == f.Hash {
+		if localHash == f.Hash {
 			localHash = hash("recovery-pending-again:" + f.Hash)
 		}
-		s.Entries[pending.Key] = Entry{PageID: pageID, ParentID: parentID, ParentType: parentType, Target: "page:" + norm(pageID), LocalHash: localHash, RemoteHash: remoteMarkdownHash(m.Markdown), ImageHashes: imageHashes}
+		s.Entries[pending.Key] = Entry{PageID: pageID, ParentID: parentID, ParentType: parentType, Target: "page:" + norm(pageID), LocalHash: localHash, RemoteHash: remoteMarkdownHash(m.Markdown)}
 	} else if after, ok := strings.CutPrefix(pending.Key, "dir:"); ok {
 		dir := after
 		if !strings.HasPrefix(rel, dir+"/") || parentType != "page_id" {

@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"sort"
 	"strings"
 
 	"github.com/yuyj109/notion-sync/internal/config"
@@ -129,11 +131,11 @@ func drawioTextRange(remote, old string) (string, bool) {
 	return start + "..." + end, true
 }
 
-// drawioTextUpdates replaces text between existing embeds without including an
-// embed in any Markdown operation. Ambiguous layouts fall back to manual sync.
-func drawioTextUpdates(ctx context.Context, api Client, a Action, remote string) ([]drawioTextUpdate, bool, error) {
-	if len(a.File.Images) == 0 || len(a.File.Images) != len(a.Entry.managedEmbeds) || len(a.TextParts) != len(a.File.Images)+1 {
-		return nil, false, nil
+// drawioMediaParts matches every local image to an existing top-level block and
+// its Markdown representation. Images and embeds are protected boundaries.
+func drawioMediaParts(ctx context.Context, api Client, a Action, remote string) ([]string, []string, bool, error) {
+	if len(a.File.Images) == 0 || len(a.TextParts) != len(a.File.Images)+1 || len(changedUnmanagedImages(a.File.Images, a.Entry)) != 0 {
+		return nil, nil, false, nil
 	}
 	var children struct {
 		Results []struct {
@@ -143,37 +145,86 @@ func drawioTextUpdates(ctx context.Context, api Client, a Action, remote string)
 		HasMore bool `json:"has_more"`
 	}
 	if err := api.API(ctx, "GET", "v1/blocks/"+a.Entry.PageID+"/children?page_size=100", nil, &children); err != nil {
-		return nil, false, fmt.Errorf("cannot inspect draw.io embed blocks: %w", err)
+		return nil, nil, false, fmt.Errorf("cannot inspect draw.io embed blocks: %w", err)
 	}
 	if children.HasMore {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
-	var ids []string
+	type mediaMatch struct {
+		start, end int
+		kind       string
+	}
+	var matches []mediaMatch
+	for _, m := range embedMarkdown.FindAllStringIndex(remote, -1) {
+		matches = append(matches, mediaMatch{m[0], m[1], "embed"})
+	}
+	for _, m := range remoteImageRE.FindAllStringIndex(remote, -1) {
+		matches = append(matches, mediaMatch{m[0], m[1], "image"})
+	}
+	sort.Slice(matches, func(i, j int) bool { return matches[i].start < matches[j].start })
+	var blocks []struct {
+		ID   string
+		Type string
+	}
 	for _, child := range children.Results {
-		if child.Type == "embed" {
-			ids = append(ids, norm(child.ID))
+		if child.Type == "embed" || child.Type == "image" {
+			blocks = append(blocks, struct {
+				ID   string
+				Type string
+			}{norm(child.ID), child.Type})
 		}
 	}
-	matches := embedMarkdown.FindAllStringIndex(remote, -1)
-	if len(ids) != len(a.File.Images) || len(matches) != len(ids) {
-		return nil, false, nil
+	if len(matches) != len(a.File.Images) || len(blocks) != len(matches) {
+		return nil, nil, false, nil
 	}
-	for i, image := range a.File.Images {
+	parts := make([]string, 0, len(matches)+1)
+	media := make([]string, 0, len(matches))
+	last := 0
+	for i, m := range matches {
+		image := a.File.Images[i]
 		id := norm(a.Entry.ImageBlocks[imageStateKey(image)])
-		if !isDrawioSVG(image) || id != ids[i] || !a.Entry.managedEmbeds[id] {
-			return nil, false, nil
+		if m.start < last || id == "" || blocks[i].ID != id || blocks[i].Type != m.kind {
+			return nil, nil, false, nil
 		}
+		value := remote[m.start:m.end]
+		if isDrawioSVG(image) {
+			if m.kind != "embed" || !a.Entry.managedEmbeds[id] {
+				return nil, nil, false, nil
+			}
+			media = append(media, value)
+		} else {
+			if m.kind != "image" {
+				return nil, nil, false, nil
+			}
+			match := remoteImageRE.FindStringSubmatch(value)
+			u, err := url.Parse(strings.Trim(match[2], "<>"))
+			if err != nil || !strings.HasPrefix(u.Fragment, "notion_record=block.") {
+				return nil, nil, false, nil
+			}
+			fields := strings.Split(strings.TrimPrefix(u.Fragment, "notion_record=block."), ".")
+			if norm(fields[0]) != id {
+				return nil, nil, false, nil
+			}
+			media = append(media, "image:"+id)
+		}
+		parts = append(parts, remote[last:m.start])
+		last = m.end
+	}
+	parts = append(parts, remote[last:])
+	return parts, media, true, nil
+}
+
+// drawioTextUpdates only replaces text between identified existing media blocks.
+func drawioTextUpdates(ctx context.Context, api Client, a Action, remote string) ([]drawioTextUpdate, bool, error) {
+	parts, _, safe, err := drawioMediaParts(ctx, api, a, remote)
+	if err != nil || !safe {
+		return nil, false, err
 	}
 	var updates []drawioTextUpdate
-	start := 0
 	for i := range a.TextParts {
-		end := len(remote)
-		if i < len(matches) {
-			end = matches[i][0]
-		}
-		old, next := strings.TrimSpace(remote[start:end]), strings.TrimSpace(a.TextParts[i])
+		old, next := strings.TrimSpace(parts[i]), strings.TrimSpace(a.TextParts[i])
 		if old != next {
-			if old == "" || strings.Contains(next, "<embed") || remoteImageRE.MatchString(old) {
+			if old == "" || strings.Contains(next, "<embed") || remoteImageRE.MatchString(next) {
 				return nil, false, nil
 			}
 			update := drawioTextUpdate{Old: old, New: next}
@@ -188,9 +239,6 @@ func drawioTextUpdates(ctx context.Context, api Client, a Action, remote string)
 				}
 			}
 			updates = append(updates, update)
-		}
-		if i < len(matches) {
-			start = matches[i][1]
 		}
 	}
 	// The API requires every old string to match exactly once, including after
@@ -259,12 +307,7 @@ func isDrawioSVG(image Image) bool {
 }
 
 func hasDrawioSVG(images []Image) bool {
-	for _, image := range images {
-		if isDrawioSVG(image) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(images, isDrawioSVG)
 }
 
 func trackDrawioEmbeds(entry *Entry, images []Image) {
@@ -276,27 +319,80 @@ func trackDrawioEmbeds(entry *Entry, images []Image) {
 	}
 }
 
-// Old metadata stores only an image hash and block ID. If the SVG has changed,
-// inspect the block to distinguish a managed embed from an ordinary image.
-func identifyManagedDrawioEmbeds(ctx context.Context, api Client, entry *Entry, images []Image) error {
-	trackDrawioEmbeds(entry, images)
-	unknown := map[string]bool{}
+// When embed mode is disabled, a stored embed hash differs from the ordinary
+// image hash even if the SVG is unchanged. Inspect any ambiguous blocks before
+// planning an update, including blocks whose local image was removed.
+func rejectDisabledManagedEmbeds(ctx context.Context, api Client, entry Entry, images []Image) error {
+	current := map[string]string{}
 	for _, image := range images {
-		id := norm(entry.ImageBlocks[imageStateKey(image)])
-		if !entry.managedEmbeds[id] {
+		current[imageStateKey(image)] = image.Hash
+		current[image.Path] = image.Hash // legacy metadata used paths as keys
+	}
+	ambiguous := false
+	for key, prior := range entry.ImageHashes {
+		if current[key] != prior {
+			ambiguous = true
+			break
+		}
+	}
+	if !ambiguous {
+		return nil
+	}
+	var children struct {
+		Results []struct {
+			ID   string `json:"id"`
+			Type string `json:"type"`
+		} `json:"results"`
+		HasMore bool `json:"has_more"`
+	}
+	if err := api.API(ctx, "GET", "v1/blocks/"+entry.PageID+"/children?page_size=100", nil, &children); err != nil {
+		return fmt.Errorf("cannot inspect existing media blocks: %w", err)
+	}
+	if children.HasMore {
+		return fmt.Errorf("cannot safely inspect existing media on a paginated page; enable --drawio-embed")
+	}
+	ids := map[string]bool{}
+	for _, id := range entry.ImageBlocks {
+		ids[norm(id)] = true
+	}
+	found := map[string]bool{}
+	for _, child := range children.Results {
+		id := norm(child.ID)
+		if ids[id] {
+			found[id] = true
+		}
+		if child.Type == "embed" && (len(ids) == 0 || ids[id]) {
+			return fmt.Errorf("existing managed draw.io embeds require --drawio-embed; enable it to preserve them")
+		}
+	}
+	if len(found) != len(ids) {
+		return fmt.Errorf("cannot safely identify existing media blocks; inspect Notion before syncing")
+	}
+	return nil
+}
+
+// Identify previously managed blocks even when their local references have
+// been removed, reordered, or replaced by non-draw.io images.
+func identifyManagedDrawioEmbeds(ctx context.Context, api Client, entry *Entry, images []Image) error {
+	entry.managedEmbeds = map[string]bool{}
+	current := map[string]Image{}
+	for _, image := range images {
+		current[imageStateKey(image)] = image
+		current[image.Path] = image // legacy metadata used paths as keys
+	}
+	unknown := map[string]bool{}
+	for key, blockID := range entry.ImageBlocks {
+		id := norm(blockID)
+		image, present := current[key]
+		prior := entry.ImageHashes[key]
+		if present && prior == image.Hash {
+			continue // unchanged ordinary image
+		}
+		if present && isDrawioSVG(image) && prior == hash("drawio-embed:"+image.Hash) {
+			entry.managedEmbeds[id] = true
 			continue
 		}
-		prior, ok := entry.ImageHashes[imageStateKey(image)]
-		if !ok {
-			prior = entry.ImageHashes[image.Path]
-		}
-		switch prior {
-		case image.Hash:
-			delete(entry.managedEmbeds, id)
-		case imageSyncHash(image):
-		default:
-			unknown[id] = true
-		}
+		unknown[id] = true
 	}
 	if len(unknown) == 0 {
 		return nil
@@ -321,8 +417,8 @@ func identifyManagedDrawioEmbeds(ctx context.Context, api Client, entry *Entry, 
 		}
 		switch child.Type {
 		case "embed":
+			entry.managedEmbeds[id] = true
 		case "image":
-			delete(entry.managedEmbeds, id)
 		default:
 			return fmt.Errorf("draw.io block %s has unexpected type %q", child.ID, child.Type)
 		}
@@ -343,6 +439,15 @@ func changedUnmanagedImages(images []Image, entry Entry) []Image {
 		changed = append(changed, image)
 	}
 	return changed
+}
+
+func changedManagedDrawio(images []Image, entry Entry) bool {
+	for _, image := range changedImages(images, entry.ImageHashes) {
+		if isDrawioSVG(image) && entry.managedEmbeds[norm(entry.ImageBlocks[imageStateKey(image)])] {
+			return true
+		}
+	}
+	return false
 }
 
 func imageHashesPreservingDrawio(images []Image, entry Entry) map[string]string {
@@ -454,7 +559,7 @@ func exportDrawioURL(c config.Config, p Plan, write bool, print func(string, ...
 			if !isDrawioSVG(image) {
 				continue
 			}
-			if action.Entry.managedEmbeds[norm(action.Entry.ImageBlocks[imageStateKey(image)])] {
+			if !action.ForceReplace && action.Entry.managedEmbeds[norm(action.Entry.ImageBlocks[imageStateKey(image)])] {
 				continue
 			}
 			filename := filepath.Join(c.SourcePath, filepath.FromSlash(image.Path))
@@ -482,16 +587,40 @@ func exportDrawioURL(c config.Config, p Plan, write bool, print func(string, ...
 			outputs[name] = content
 		}
 	}
-	if len(outputs) == 0 || !write {
+	if len(outputs) == 0 {
 		return nil
 	}
 	dir := filepath.Join(c.WorkDir, ".notion-sync")
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
-	}
 	info, err := os.Lstat(dir)
+	if os.IsNotExist(err) {
+		if !write {
+			return nil
+		}
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return err
+		}
+		info, err = os.Lstat(dir)
+	}
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("draw.io output directory must be a real directory: %s", dir)
+	}
+	// Check all destinations before writing any, including during dry-run.
+	for name, content := range outputs {
+		dest := filepath.Join(dir, name)
+		info, err := os.Lstat(dest)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil || !info.Mode().IsRegular() {
+			return fmt.Errorf("draw.io output exists and is not a regular file: %s", dest)
+		}
+		old, err := os.ReadFile(dest)
+		if err != nil || !bytes.Equal(old, content) {
+			return fmt.Errorf("draw.io output already exists with different content; move it before syncing: %s", dest)
+		}
+	}
+	if !write {
+		return nil
 	}
 	for name, content := range outputs {
 		dest := filepath.Join(dir, name)

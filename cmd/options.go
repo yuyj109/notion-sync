@@ -21,10 +21,10 @@ type runtimeOptions struct {
 func (o *runtimeOptions) addFlags(root *cobra.Command) {
 	f := root.PersistentFlags()
 	f.StringVar(&o.envFile, "env-file", config.DefaultEnvFile, "environment file")
-	f.StringVar(&o.source, "source", "", "Markdown source directory (default ./docs)")
-	f.StringVar(&o.parentID, "parent-id", "", "default Notion parent page or database ID")
+	f.StringVar(&o.source, "source", "", "Markdown source directory (single files must be inside it; default ./docs)")
+	f.StringVar(&o.parentID, "parent-id", "", "default Notion parent page or database ID (not URL or title)")
 	f.StringVar(&o.parentType, "parent-type", "auto", "parent type: auto, page, or db")
-	f.BoolVar(&o.preserve, "preserve-hierarchy", true, "reproduce directory hierarchy")
+	f.BoolVar(&o.preserve, "preserve-hierarchy", true, "reproduce directory hierarchy for page parents (databases are flat)")
 	f.BoolVar(&o.drawioEmbed, "drawio-embed", false, "export draw.io viewer URLs and create empty embeds")
 	f.StringVar(&o.metadataFormat, "metadata-format", "frontmatter", "metadata format: frontmatter or comment")
 	f.StringSliceVar(&o.include, "include", nil, "include patterns (repeatable or comma-separated)")

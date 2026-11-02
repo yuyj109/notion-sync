@@ -2,7 +2,6 @@ package sync
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"fmt"
 	"os"
 	"path"
@@ -40,25 +39,35 @@ type Metadata struct {
 	Pending     *Pending         `yaml:"pending,omitempty"`
 }
 type State struct {
-	Version   int              `json:"version"`
-	RootID    string           `json:"rootId"`
-	Source    string           `json:"source"`
-	Entries   map[string]Entry `json:"entries"`
-	Pending   *Pending         `json:"pending,omitempty"`
-	Documents map[string]*File `json:"-"`
-	Active    map[string]bool  `json:"-"`
-	Skipped   map[string]bool  `json:"-"`
+	Version               int              `json:"version"`
+	RootID                string           `json:"rootId"`
+	Source                string           `json:"source"`
+	Entries               map[string]Entry `json:"entries"`
+	Pending               *Pending         `json:"pending,omitempty"`
+	Documents             map[string]*File `json:"-"`
+	Active                map[string]bool  `json:"-"`
+	Skipped               map[string]bool  `json:"-"`
+	PendingOwner          string           `json:"-"`
+	sharedMigrated        bool             `json:"-"`
+	needsSharedCheckpoint bool             `json:"-"`
 }
 
 func loadState(c config.Config) (State, error) {
 	return loadStateWithPending(c, false)
 }
 func loadStateWithPending(c config.Config, allowPending bool) (State, error) {
+	return loadStateForFile(c, allowPending, "")
+}
+
+func loadStateForFile(c config.Config, allowPending bool, selected string) (State, error) {
 	s := State{Version: 1, RootID: config.FormatID(c.Notion.ParentPageID), Source: c.SourcePath, Entries: map[string]Entry{}, Documents: map[string]*File{}, Active: map[string]bool{}}
 	if c.Notion.ParentDatabaseID != "" {
 		s.RootID = config.FormatID(c.Notion.ParentDatabaseID)
 	}
-	files, err := Scan(c)
+	if err := loadSharedState(c, &s); err != nil {
+		return s, err
+	}
+	files, err := scan(c, selected)
 	if err != nil {
 		return s, err
 	}
@@ -82,17 +91,30 @@ func loadStateWithPending(c config.Config, allowPending bool) (State, error) {
 			s.Entries["file:"+f.Path] = *m.Entry
 		}
 		for d, e := range m.Directories {
-			if prior, ok := s.Entries["dir:"+d]; ok && !reflect.DeepEqual(prior, e) {
+			if prior, ok := s.Entries["dir:"+d]; ok && !sameDirectory(prior, e) {
 				return s, fmt.Errorf("conflicting directory metadata for %s", d)
 			}
 			s.Entries["dir:"+d] = e
 		}
 		if m.Pending != nil {
-			if s.Pending != nil && !reflect.DeepEqual(s.Pending, m.Pending) {
+			if s.Pending != nil && !compatiblePending(s.Pending, m.Pending) {
 				return s, fmt.Errorf("conflicting pending metadata")
 			}
-			s.Pending = m.Pending
+			if s.PendingOwner != "" && s.PendingOwner != f.Path {
+				return s, fmt.Errorf("conflicting pending owner")
+			}
+			if s.Pending == nil || s.Pending.PageID == "" {
+				s.Pending = m.Pending
+			}
+			s.PendingOwner = f.Path
 		}
+	}
+	if !s.sharedMigrated {
+		if err := loadExcludedMetadata(c, &s); err != nil {
+			return s, err
+		}
+		s.sharedMigrated = true
+		s.needsSharedCheckpoint = true
 	}
 	if s.Pending != nil && !allowPending {
 		return s, fmt.Errorf("an earlier create for %s may have succeeded; inspect Notion and use recover --page-id or recover --not-created", s.Pending.Key)
@@ -120,6 +142,10 @@ func saveState(c config.Config, s State) error {
 		}
 		if pendingOwner == "" || s.Documents[pendingOwner] == nil {
 			return fmt.Errorf("cannot persist pending state")
+		}
+		s.PendingOwner = pendingOwner
+		if err := saveSharedState(c, s); err != nil {
+			return err
 		}
 	}
 	for _, name := range names {
@@ -155,7 +181,7 @@ func saveState(c config.Config, s State) error {
 			return err
 		}
 	}
-	return nil
+	return saveSharedState(c, s)
 }
 
 func verifyFileUnchanged(c config.Config, f *File) error {
@@ -230,7 +256,7 @@ func writeMetadataBody(c config.Config, f *File, m *Metadata, replacement *strin
 	if err != nil {
 		return err
 	}
-	if err = os.Rename(tmpName, filename); err != nil {
+	if err = replaceUnchangedFile(filename, tmpName, current, info); err != nil {
 		return err
 	}
 	f.Raw = result
@@ -241,6 +267,27 @@ func writeMetadataBody(c config.Config, f *File, m *Metadata, replacement *strin
 		f.PageID = m.Entry.PageID
 	}
 	return nil
+}
+
+// replaceUnchangedFile checks again after preparing the replacement, including
+// an identity check for editors that save by renaming a new inode into place.
+// The check and rename cannot be atomic with respect to non-cooperating writers.
+func replaceUnchangedFile(filename, temporary string, expected []byte, original os.FileInfo) error {
+	info, err := os.Lstat(filename)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || !os.SameFile(info, original) {
+		return fmt.Errorf("%s changed while preparing the replacement", filename)
+	}
+	current, err := os.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(current, expected) {
+		return fmt.Errorf("%s changed while preparing the replacement", filename)
+	}
+	return os.Rename(temporary, filename)
 }
 
 func renderMetadata(root *yaml.Node, body, nl, format string, original []byte) ([]byte, error) {
@@ -303,17 +350,9 @@ func renderMetadata(root *yaml.Node, body, nl, format string, original []byte) (
 	}
 	return []byte(prefix + "<!-- notion-sync" + nl + header + nl + "-->" + nl + body), nil
 }
-func lock(c config.Config) (func(), error) {
-	workDir, err := filepath.Abs(c.WorkDir)
-	if err != nil {
-		return nil, fmt.Errorf("resolve working directory: %w", err)
-	}
-	workDir, err = filepath.EvalSymlinks(workDir)
-	if err != nil {
-		return nil, fmt.Errorf("resolve working directory: %w", err)
-	}
-	digest := sha256.Sum256([]byte(workDir))
-	name := filepath.Join(os.TempDir(), fmt.Sprintf("notion-sync-%x.lock", digest))
+func lock() (func(), error) {
+	// A single lock also covers overlapping source roots, reset, and recover.
+	name := filepath.Join(os.TempDir(), fmt.Sprintf("notion-sync-%d.lock", os.Getuid()))
 	f, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		if os.IsExist(err) {

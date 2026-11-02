@@ -31,8 +31,11 @@ func addPageCommands(root *cobra.Command, opts *runtimeOptions) {
 	page := &cobra.Command{Use: "page", Short: "Work with Notion pages"}
 	root.AddCommand(page)
 	for _, name := range []string{"sync", "diff"} {
-		var dry, push, overwrite bool
-		c := &cobra.Command{Use: name + " <file>", Args: cobra.ExactArgs(1), Short: "Plan or synchronize one Markdown file", RunE: func(cmd *cobra.Command, args []string) error {
+		var dry, push, overwrite, replaceDrawio, pull bool
+		c := &cobra.Command{Use: name + " <file>", Args: cobra.ExactArgs(1), Short: "Plan or synchronize one Markdown file", Long: "The file must be inside the configured source directory. --source overrides NOTION_SYNC_SOURCE and .env; if no source is configured, the file's directory is used.", RunE: func(cmd *cobra.Command, args []string) error {
+			if pull && (push || overwrite || replaceDrawio) {
+				return fmt.Errorf("--pull cannot be combined with --push or --replace-drawio-embeds")
+			}
 			fallback, err := syncer.FileRootID(args[0])
 			if err != nil {
 				return err
@@ -41,16 +44,28 @@ func addPageCommands(root *cobra.Command, opts *runtimeOptions) {
 			if err != nil {
 				return err
 			}
+			if replaceDrawio && !push && !overwrite {
+				return fmt.Errorf("--replace-drawio-embeds requires --push")
+			}
+			if replaceDrawio && !cfg.Sync.DrawioEmbed {
+				return fmt.Errorf("--replace-drawio-embeds requires --drawio-embed")
+			}
+			cfg.Sync.ReplaceDrawioEmbeds = replaceDrawio
 			if err := resolveParentID(cmd.Context(), &cfg, notion.Runner{}); err != nil {
 				return err
 			}
 			return withLockRecovery(cmd, func() error {
+				if pull {
+					return syncer.PullFile(cmd.Context(), cfg, notion.Runner{}, args[0], !dry, func(format string, args ...any) { printSync(cmd.OutOrStdout(), format, args...) })
+				}
 				return syncer.RunFile(cmd.Context(), cfg, notion.Runner{}, args[0], name == "sync" && !dry, func(format string, args ...any) { printSync(cmd.OutOrStdout(), format, args...) }, push || overwrite)
 			})
 		}}
 		if name == "sync" {
 			c.Flags().BoolVar(&dry, "dry-run", false, "show changes without writing")
-			c.Flags().BoolVar(&push, "push", false, "overwrite pages changed in Notion with local content")
+			c.Flags().BoolVar(&push, "push", false, "overwrite conflicting Notion content")
+			c.Flags().BoolVar(&pull, "pull", false, "import supported Notion changes into this file")
+			c.Flags().BoolVar(&replaceDrawio, "replace-drawio-embeds", false, "with --push and --drawio-embed, recreate embeds empty on updated pages")
 			c.Flags().BoolVar(&overwrite, "overwrite", false, "alias for --push")
 			_ = c.Flags().MarkHidden("overwrite")
 		}

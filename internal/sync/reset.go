@@ -27,14 +27,8 @@ func Reset(target string, dryRun bool, print func(string, ...any)) error {
 	if info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("target must not be a symlink")
 	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-	var c config.Config
-	c.WorkDir = cwd
 	if !dryRun {
-		unlock, err := lock(c)
+		unlock, err := lock()
 		if err != nil {
 			return err
 		}
@@ -64,6 +58,9 @@ func Reset(target string, dryRun bool, print func(string, ...any)) error {
 		return fmt.Errorf("target must be a Markdown file or directory")
 	}
 	sort.Strings(paths)
+	if err := rejectSharedPendingReset(paths); err != nil {
+		return err
+	}
 	var changes []resetFile
 	for _, name := range paths {
 		f, err := prepareReset(name)
@@ -85,6 +82,58 @@ func Reset(target string, dryRun bool, print func(string, ...any)) error {
 			return fmt.Errorf("%s: %w", f.name, err)
 		}
 		print("cleared %s", f.name)
+	}
+	return nil
+}
+
+// A pending journal can exist without Markdown metadata if a write was
+// interrupted. Check every possible source root containing a selected file.
+func rejectSharedPendingReset(paths []string) error {
+	selected := map[string]bool{}
+	roots := map[string]bool{}
+	for _, name := range paths {
+		resolved, err := filepath.EvalSymlinks(name)
+		if err != nil {
+			return err
+		}
+		resolved, err = filepath.Abs(resolved)
+		if err != nil {
+			return err
+		}
+		selected[resolved] = true
+		for dir := filepath.Dir(resolved); ; dir = filepath.Dir(dir) {
+			roots[dir] = true
+			if filepath.Dir(dir) == dir {
+				break
+			}
+		}
+	}
+	for root := range roots {
+		entries, err := os.ReadDir(filepath.Join(root, ".notion-sync"))
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect shared sync state: %w", err)
+		}
+		for _, entry := range entries {
+			id, ok := strings.CutPrefix(entry.Name(), "state-")
+			if !ok || !strings.HasSuffix(id, ".json") {
+				continue
+			}
+			id = strings.TrimSuffix(id, ".json")
+			if !config.ValidID(id) || id != norm(id) || !entry.Type().IsRegular() {
+				return fmt.Errorf("invalid shared sync state file %s", entry.Name())
+			}
+			c := config.Config{SourcePath: root}
+			s := State{RootID: id, Entries: map[string]Entry{}}
+			if err := loadSharedState(c, &s); err != nil {
+				return err
+			}
+			if s.Pending != nil && selected[filepath.Join(root, filepath.FromSlash(s.PendingOwner))] {
+				return fmt.Errorf("%s: pending creation must be resolved with recover before clearing metadata", s.PendingOwner)
+			}
+		}
 	}
 	return nil
 }
@@ -184,5 +233,5 @@ func writeReset(f resetFile) error {
 	if err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), f.name)
+	return replaceUnchangedFile(f.name, tmp.Name(), f.before, info)
 }

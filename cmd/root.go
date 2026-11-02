@@ -41,7 +41,10 @@ func showHelpOnMissingParameters(root *cobra.Command) {
 func execute(root *cobra.Command) error {
 	command, err := root.ExecuteC()
 	if err != nil && (errors.Is(err, errMissingParameter) || errors.Is(err, config.ErrParentRequired)) {
-		return command.Help()
+		if helpErr := command.Help(); helpErr != nil {
+			return errors.Join(err, helpErr)
+		}
+		return err
 	}
 	return err
 }

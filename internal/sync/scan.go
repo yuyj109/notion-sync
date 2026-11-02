@@ -112,30 +112,172 @@ func remoteMarkdownHash(body string) string {
 }
 
 func canonicalRemoteMarkdown(body string) string {
-	return remoteImageRE.ReplaceAllStringFunc(body, func(value string) string {
-		parts := remoteImageRE.FindStringSubmatch(value)
-		if len(parts) < 3 {
-			return value
+	return normalizeRemoteImages(body, false)
+}
+
+// Restrict S3 signature normalization to Notion's own buckets and paths.
+func isNotionSignedImageURL(u *url.URL) bool {
+	host := strings.ToLower(u.Hostname())
+	canonical := *u
+	notionHost := u.Scheme == "https" && u.User == nil && u.Port() == "" && host == "files.notion.so" || canonicalNotionS3URL(&canonical)
+	if !notionHost {
+		return false
+	}
+	for key := range u.Query() {
+		if strings.EqualFold(key, "signature") || strings.EqualFold(key, "x-amz-signature") {
+			return true
 		}
+	}
+	return false
+}
+
+// Normalize credentials inside both a Notion proxy path and the outer URL.
+// On display, malformed proxy sources are hidden instead of risking a leak.
+func normalizeImageURL(u *url.URL, display bool, depth int) bool {
+	changed := false
+	proxyURL := *u
+	if display {
+		proxyURL.User = nil
+		if proxyURL.Scheme == "" && proxyURL.Host != "" {
+			proxyURL.Scheme = "https"
+		}
+	}
+	if source, ok, err := notionImageProxySource(&proxyURL); ok {
+		if err != nil || depth >= 3 {
+			if display {
+				u.Path, u.RawPath = "/image/[redacted]", ""
+				changed = true
+			}
+		} else if nested, parseErr := url.Parse(source); parseErr != nil || nested.Scheme == "" {
+			if display {
+				u.Path, u.RawPath = "/image/[redacted]", ""
+				changed = true
+			}
+		} else if normalizeImageURL(nested, display, depth+1) {
+			u.Path = "/image/" + nested.String()
+			u.RawPath = "/image/" + url.PathEscape(nested.String())
+			changed = true
+		}
+	}
+	if !display && !isNotionSignedImageURL(u) {
+		return changed
+	}
+	if display && u.User != nil {
+		u.User = nil
+		changed = true
+	}
+	query, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		if display {
+			u.RawQuery, u.ForceQuery = "", false
+			return true
+		}
+		return changed
+	}
+	for key := range query {
+		lower := strings.ToLower(key)
+		if display && (lower == "sig" || strings.Contains(lower, "signature") || strings.Contains(lower, "token") || strings.Contains(lower, "secret") || strings.HasPrefix(lower, "x-amz-") || strings.HasPrefix(lower, "x-goog-") || lower == "expires" || lower == "policy" || lower == "key-pair-id" || lower == "awsaccesskeyid" || lower == "googleaccessid") || !display && (lower == "signature" || strings.HasPrefix(lower, "x-amz-") || lower == "expires" || lower == "awsaccesskeyid") {
+			query.Del(key)
+		}
+	}
+	u.RawQuery, u.ForceQuery = query.Encode(), false
+	if !display {
+		canonicalNotionS3URL(u)
+	}
+	return true
+}
+
+func normalizeRemoteImages(body string, display bool) string {
+	protected := make([]bool, len(body))
+	if !display {
+		doc := goldmark.DefaultParser().Parse(text.NewReader([]byte(body)))
+		_ = ast.Walk(doc, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+			if !entering {
+				return ast.WalkContinue, nil
+			}
+			mark := func(start, end int) {
+				for i := start; i < end && i < len(protected); i++ {
+					protected[i] = true
+				}
+			}
+			switch node.Kind() {
+			case ast.KindCodeBlock, ast.KindFencedCodeBlock:
+				for i := 0; i < node.Lines().Len(); i++ {
+					segment := node.Lines().At(i)
+					mark(segment.Start, segment.Stop)
+				}
+			case ast.KindCodeSpan:
+				for child := node.FirstChild(); child != nil; child = child.NextSibling() {
+					if part, ok := child.(*ast.Text); ok {
+						mark(part.Segment.Start, part.Segment.Stop)
+					}
+				}
+			}
+			return ast.WalkContinue, nil
+		})
+	}
+	var out strings.Builder
+	last := 0
+	for _, loc := range remoteImageRE.FindAllStringIndex(body, -1) {
+		out.WriteString(body[last:loc[0]])
+		value := body[loc[0]:loc[1]]
+		if !display && protected[loc[0]] {
+			out.WriteString(value)
+			last = loc[1]
+			continue
+		}
+		parts := remoteImageRE.FindStringSubmatch(value)
 		urlText := strings.Trim(parts[2], "<>")
 		parsed, err := url.Parse(urlText)
-		if err != nil || parsed.Scheme == "" {
-			return value
+		switch {
+		case err != nil:
+			if display {
+				out.WriteString("![" + parts[1] + "](<redacted-invalid-url>)" + parts[3])
+			} else {
+				out.WriteString(value)
+			}
+		case parsed.Scheme == "" && (!display || parsed.Host == "" && parsed.RawQuery == ""):
+			out.WriteString(value)
+		case normalizeImageURL(parsed, display, 0):
+			out.WriteString("![" + parts[1] + "](<" + parsed.String() + ">)" + parts[3])
+		default:
+			out.WriteString(value)
 		}
-		parsed.RawQuery = ""
-		parsed.ForceQuery = false
-		return "![" + parts[1] + "](<" + parsed.String() + ">)" + parts[3]
-	})
+		last = loc[1]
+	}
+	out.WriteString(body[last:])
+	return out.String()
 }
 
 // localImages resolves standalone Markdown image lines beneath the source root.
 // The image URLs are not rewritten here, so hashes continue to represent source Markdown.
 func localImages(body, markdownPath, sourceRoot string) ([]Image, error) {
+	// Inline local images cannot be uploaded in their original position. Reject
+	// them before sending Markdown that Notion cannot resolve as a local path.
+	protected := protectedMarkdown(body)
+	for _, loc := range remoteImageRE.FindAllStringIndex(body, -1) {
+		start, end := loc[0], loc[1]
+		if protected[start] || escapedAt(body, start) || !isLocalImage(body[start:end]) {
+			continue
+		}
+		lineStart := strings.LastIndex(body[:start], "\n") + 1
+		lineEnd := len(body)
+		if next := strings.IndexByte(body[end:], '\n'); next >= 0 {
+			lineEnd = end + next
+		}
+		if strings.TrimSpace(body[lineStart:lineEnd]) != body[start:end] {
+			return nil, fmt.Errorf("%s: local images must be standalone Markdown lines with a simple relative path", markdownPath)
+		}
+	}
 	lines := strings.Split(body, "\n")
+	codeLines := protectedImageLines(body)
 	var images []Image
 	var fence byte
 	var fenceLen int
-	for _, line := range lines {
+	for lineNo, line := range lines {
+		if codeLines[lineNo] {
+			continue
+		}
 		trimmed := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
 		if len(trimmed) >= 3 && (trimmed[0] == '`' || trimmed[0] == '~') {
 			n := 0
@@ -214,6 +356,26 @@ func localImages(body, markdownPath, sourceRoot string) ([]Image, error) {
 		key := fmt.Sprintf("image-%d", len(images)+1)
 		images = append(images, Image{Alt: match[1], Path: filepath.ToSlash(rel), Name: filepath.Base(resolved), ContentType: contentType, Hash: hash(string(data)), Caption: caption, Key: key, SourceLine: trimmed})
 	}
+	// Goldmark resolves full, collapsed, and shortcut references. Compare its
+	// local image count with the standalone forms we can actually upload so a
+	// reference-style image is never silently sent with a local destination.
+	localCount := 0
+	doc := goldmark.DefaultParser().Parse(text.NewReader([]byte(body)))
+	_ = ast.Walk(doc, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		if entering {
+			if img, ok := node.(*ast.Image); ok {
+				ref := string(img.Destination)
+				u, err := url.Parse(ref)
+				if err == nil && !u.IsAbs() && u.Host == "" && u.Path != "" {
+					localCount++
+				}
+			}
+		}
+		return ast.WalkContinue, nil
+	})
+	if localCount != len(images) {
+		return nil, fmt.Errorf("%s: local images must be standalone Markdown lines with a simple relative path", markdownPath)
+	}
 	return images, nil
 }
 
@@ -236,11 +398,16 @@ func imageContentType(ext string) string {
 
 func bodyWithoutImages(body string) (string, []int, error) {
 	lines := strings.Split(body, "\n")
+	codeLines := protectedImageLines(body)
 	var indices []int
 	var textLines []string
 	var fence byte
 	var fenceLen int
 	for i, line := range lines {
+		if codeLines[i] {
+			textLines = append(textLines, line)
+			continue
+		}
 		trimmed := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
 		if len(trimmed) >= 3 && (trimmed[0] == '`' || trimmed[0] == '~') {
 			n := 0
@@ -253,6 +420,7 @@ func bodyWithoutImages(body string) (string, []int, error) {
 				} else if trimmed[0] == fence && n >= fenceLen {
 					fence = 0
 				}
+				textLines = append(textLines, line)
 				continue
 			}
 		}
@@ -279,6 +447,7 @@ func isLocalImage(line string) bool {
 
 func imageTextParts(body string) ([]string, error) {
 	lines := strings.Split(body, "\n")
+	codeLines := protectedImageLines(body)
 	var parts []string
 	var current []string
 	var fence byte
@@ -294,7 +463,11 @@ func imageTextParts(body string) ([]string, error) {
 		parts = append(parts, strings.Join(current[start:end], "\n"))
 		current = nil
 	}
-	for _, line := range lines {
+	for lineNo, line := range lines {
+		if codeLines[lineNo] {
+			current = append(current, line)
+			continue
+		}
 		trimmed := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
 		if len(trimmed) >= 3 && (trimmed[0] == '`' || trimmed[0] == '~') {
 			n := 0
@@ -319,6 +492,33 @@ func imageTextParts(body string) ([]string, error) {
 	}
 	flush()
 	return parts, nil
+}
+
+func protectedImageLines(body string) map[int]bool {
+	protected := make([]bool, len(body))
+	doc := goldmark.DefaultParser().Parse(text.NewReader([]byte(body)))
+	_ = ast.Walk(doc, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		if entering && (node.Kind() == ast.KindCodeBlock || node.Kind() == ast.KindFencedCodeBlock) {
+			for i := 0; i < node.Lines().Len(); i++ {
+				segment := node.Lines().At(i)
+				for j := segment.Start; j < segment.Stop && j < len(protected); j++ {
+					protected[j] = true
+				}
+			}
+		}
+		return ast.WalkContinue, nil
+	})
+	result := map[int]bool{}
+	line := 0
+	for i := range body {
+		if protected[i] {
+			result[line] = true
+		}
+		if body[i] == '\n' {
+			line++
+		}
+	}
+	return result
 }
 
 func hash(s string) string { sum := sha256.Sum256([]byte(s)); return hex.EncodeToString(sum[:]) }
@@ -567,14 +767,15 @@ func FileRootID(filename string) (string, error) {
 
 func glob(pattern, name string) (bool, error) {
 	pattern = filepath.ToSlash(pattern)
+	runes := []rune(pattern)
 	var b bytes.Buffer
 	b.WriteString("^")
-	for i := 0; i < len(pattern); i++ {
-		switch pattern[i] {
+	for i := 0; i < len(runes); i++ {
+		switch runes[i] {
 		case '*':
-			if i+1 < len(pattern) && pattern[i+1] == '*' {
+			if i+1 < len(runes) && runes[i+1] == '*' {
 				i++
-				if i+1 < len(pattern) && pattern[i+1] == '/' {
+				if i+1 < len(runes) && runes[i+1] == '/' {
 					i++
 					b.WriteString("(?:.*/)?")
 				} else {
@@ -588,7 +789,7 @@ func glob(pattern, name string) (bool, error) {
 		case '[':
 			return false, fmt.Errorf("character classes are not supported in glob %q", pattern)
 		default:
-			b.WriteString(regexp.QuoteMeta(string(pattern[i])))
+			b.WriteString(regexp.QuoteMeta(string(runes[i])))
 		}
 	}
 	b.WriteString("$")
@@ -610,7 +811,31 @@ func match(patterns []string, name string) (bool, error) {
 	}
 	return false, nil
 }
+
+// excludedTree only prunes patterns that exclude every descendant, not
+// patterns such as dir/*.md that can leave nested files included.
+func excludedTree(patterns []string, dir string) (bool, error) {
+	for _, pattern := range patterns {
+		pattern = filepath.ToSlash(pattern)
+		if pattern == "**" {
+			return true, nil
+		}
+		if prefix, ok := strings.CutSuffix(pattern, "/**"); ok {
+			matched, err := glob(prefix, dir)
+			if err != nil || matched {
+				return matched, err
+			}
+		}
+	}
+	return false, nil
+}
 func Scan(c config.Config) ([]File, error) {
+	return scan(c, "")
+}
+
+// A single-file operation still reads metadata from other files, but only
+// resolves images for the selected file.
+func scan(c config.Config, selected string) ([]File, error) {
 	root, err := filepath.EvalSymlinks(c.SourcePath)
 	if err != nil {
 		return nil, fmt.Errorf("source: %w", err)
@@ -639,6 +864,13 @@ func Scan(c config.Config) ([]File, error) {
 			return nil
 		}
 		if d.IsDir() {
+			excluded, err := excludedTree(c.Sync.Exclude, rel)
+			if err != nil {
+				return err
+			}
+			if excluded {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if !d.Type().IsRegular() || strings.ToLower(path.Ext(rel)) != ".md" {
@@ -664,8 +896,10 @@ func Scan(c config.Config) ([]File, error) {
 			return fmt.Errorf("%s: %w", rel, e)
 		}
 		f.Path = rel
-		if e = resolveImages(&f, root); e != nil {
-			return fmt.Errorf("%s: %w", rel, e)
+		if selected == "" || selected == rel {
+			if e = resolveImages(&f, root); e != nil {
+				return fmt.Errorf("%s: %w", rel, e)
+			}
 		}
 		files = append(files, f)
 		return nil

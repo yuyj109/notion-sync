@@ -103,6 +103,7 @@ func TestResolveParentID(t *testing.T) {
 }
 
 func TestParentIDCommands(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
 	const parentID = "11111111-1111-1111-1111-111111111111"
 	const dataSourceID = "22222222-2222-2222-2222-222222222222"
 	for _, kind := range []string{"page", "database"} {
@@ -249,6 +250,16 @@ func TestCommandOptionsAndSourceArgument(t *testing.T) {
 	}
 }
 
+func TestResetRejectsExplicitFilters(t *testing.T) {
+	for _, flag := range []string{"--include", "--exclude"} {
+		root := newRootCommand()
+		root.SetArgs([]string{"reset", t.TempDir(), "--dry-run", flag, "*.md"})
+		if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "not supported by reset") {
+			t.Fatalf("%s: %v", flag, err)
+		}
+	}
+}
+
 func TestHelpOnMissingParameters(t *testing.T) {
 	t.Setenv("NOTION_SYNC_PARENT_ID", "")
 	t.Setenv("NOTION_SYNC_PARENT_PAGE_ID", "")
@@ -275,8 +286,8 @@ func TestHelpOnMissingParameters(t *testing.T) {
 		opts.envFile = filepath.Join(dir, "missing.env")
 		root.SetArgs(tc.args)
 		err := execute(root)
-		if (err == nil) != tc.wantHelp {
-			t.Fatalf("%v: error = %v, want help = %v", tc.args, err, tc.wantHelp)
+		if err == nil {
+			t.Fatalf("%v: expected an error for invalid arguments", tc.args)
 		}
 		if got := strings.Contains(stdout.String(), "Usage:"); got != tc.wantHelp {
 			t.Errorf("%v: help = %v, want %v; stdout: %q", tc.args, got, tc.wantHelp, stdout.String())

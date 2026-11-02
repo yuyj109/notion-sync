@@ -72,7 +72,7 @@ func uploadImage(ctx context.Context, uploader MultipartClient, image Image, fil
 	if err != nil {
 		return "", err
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 	prepared := filepath.Join(dir, image.Name)
 	if err := os.WriteFile(prepared, cleaned, 0600); err != nil {
 		return "", err

@@ -30,12 +30,14 @@ func addRecoverCommand(root *cobra.Command, opts *runtimeOptions) {
 				return err
 			}
 		}
-		message, err := syncer.Recover(cmd.Context(), cfg, notion.Runner{}, args[0], pageID, notCreated)
-		if err != nil {
+		return withLockRecovery(cmd, func() error {
+			message, err := syncer.Recover(cmd.Context(), cfg, notion.Runner{}, args[0], pageID, notCreated)
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintln(cmd.OutOrStdout(), message)
 			return err
-		}
-		_, err = fmt.Fprintln(cmd.OutOrStdout(), message)
-		return err
+		})
 	}}
 	c.Flags().StringVar(&pageID, "page-id", "", "verified existing page ID or URL")
 	c.Flags().BoolVar(&notCreated, "not-created", false, "confirm no page was created")

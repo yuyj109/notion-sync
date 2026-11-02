@@ -37,6 +37,8 @@ type File struct {
 // Image is a local Markdown image reference that can be uploaded to Notion.
 type Image struct {
 	Alt, Path, Name, ContentType, Hash, Key string
+	SourceLine                              string
+	StateHash                               string
 	Caption                                 []any
 }
 
@@ -211,7 +213,7 @@ func localImages(body, markdownPath, sourceRoot string) ([]Image, error) {
 			caption = []any{map[string]any{"type": "text", "text": map[string]any{"content": match[1]}}}
 		}
 		key := fmt.Sprintf("image-%d", len(images)+1)
-		images = append(images, Image{Alt: match[1], Path: filepath.ToSlash(rel), Name: filepath.Base(resolved), ContentType: contentType, Hash: hash(string(data)), Caption: caption, Key: key})
+		images = append(images, Image{Alt: match[1], Path: filepath.ToSlash(rel), Name: filepath.Base(resolved), ContentType: contentType, Hash: hash(string(data)), Caption: caption, Key: key, SourceLine: trimmed})
 	}
 	return images, nil
 }
@@ -325,7 +327,7 @@ func hash(s string) string { sum := sha256.Sum256([]byte(s)); return hex.EncodeT
 func imageHashMap(images []Image) map[string]string {
 	result := make(map[string]string, len(images))
 	for _, image := range images {
-		result[imageStateKey(image)] = image.Hash
+		result[imageStateKey(image)] = imageSyncHash(image)
 	}
 	return result
 }
@@ -337,11 +339,18 @@ func changedImages(images []Image, prior map[string]string) []Image {
 		if !ok {
 			old = prior[image.Path]
 		} // read frontmatter written before image keys were introduced
-		if old != image.Hash {
+		if old != imageSyncHash(image) {
 			changed = append(changed, image)
 		}
 	}
 	return changed
+}
+
+func imageSyncHash(image Image) string {
+	if image.StateHash != "" {
+		return image.StateHash
+	}
+	return image.Hash
 }
 
 func imageStateKey(image Image) string {

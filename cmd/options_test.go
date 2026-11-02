@@ -22,6 +22,21 @@ type parentIDClient struct {
 	requests  []string
 }
 
+func TestDrawioEmbedFlagOverridesEnvironment(t *testing.T) {
+	t.Setenv("NOTION_SYNC_DRAWIO_EMBED", "true")
+	t.Setenv("NOTION_SYNC_PARENT_ID", "0123456789abcdef0123456789abcdef")
+	root := &cobra.Command{Use: "test"}
+	opts := runtimeOptions{}
+	opts.addFlags(root)
+	if err := root.PersistentFlags().Parse([]string{"--drawio-embed=false"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := opts.resolve(root, "", "", "")
+	if err != nil || cfg.Sync.DrawioEmbed {
+		t.Fatalf("explicit false should disable environment setting: %v, %v", cfg.Sync.DrawioEmbed, err)
+	}
+}
+
 func (client *parentIDClient) API(_ context.Context, method, endpoint string, _ any, result any) error {
 	client.requests = append(client.requests, method+" "+endpoint)
 	if err := client.errors[endpoint]; err != nil {

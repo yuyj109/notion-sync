@@ -115,6 +115,7 @@ notion-sync <command> --help
 | `NOTION_SYNC_PARENT_TYPE` | `--parent-type` | `auto` |
 | `NOTION_SYNC_SOURCE` | `--source` または同期元の引数 | `./docs` |
 | `NOTION_SYNC_PRESERVE_HIERARCHY` | `--preserve-hierarchy` | `true` |
+| `NOTION_SYNC_DRAWIO_EMBED` | `--drawio-embed` | `false` |
 | `NOTION_SYNC_METADATA_FORMAT` | `--metadata-format` | `frontmatter` |
 | `NOTION_SYNC_INCLUDE` | `--include` | `**/*.md` |
 | `NOTION_SYNC_EXCLUDE` | `--exclude` | `**/node_modules/**` |
@@ -128,6 +129,8 @@ notion-sync sync ./docs
 ```
 
 同期情報を HTML コメントに保存するには、`NOTION_SYNC_METADATA_FORMAT=comment` を環境変数または `.env` に設定するか、`--metadata-format comment` を指定します。`frontmatter` が従来の既定値です。形式を変更すると次の同期で既存の同期情報も変換されます。継続して同じ形式を使うには環境変数または `.env` に設定してください。
+
+draw.io の埋め込み方式を常に使うには、環境変数または `.env` に `NOTION_SYNC_DRAWIO_EMBED=true` を設定します。コマンドのオプションは環境変数より優先されるため、一時的に無効にするには `--drawio-embed=false` を指定します。`--pull` とは併用できません。
 
 ## 仕組み
 
@@ -180,6 +183,8 @@ notion-page-id: "<existing-page-id>"
 - 同期済みページの本文や親に変更がある場合、競合として停止します。競合確認と更新の間の変更は防げません。
 - 既存ページを初めて指定する場合、本文が空かローカルと一致するときのみ同期します。
 - Markdown の単独行 `![説明](images/photo.png)` で指定したローカル画像を本文中の位置にアップロードできます。画像は Markdown からの相対パスで、同期元ディレクトリ内の通常ファイルに限り、PNG、JPEG、GIF、WebP、SVG の各20 MB以下です。本文が変わらず画像の hash だけが変わった場合は、画像を再アップロードして既存の画像ブロックを置き換えます。本文が変わった場合は、本文とすべてのローカル画像を元の順に再作成します。ローカル画像の削除は未対応です。アップロード結果が不明な場合は再実行前に Notion を確認してください。
+- draw.io 形式の SVG は、アップロード時に埋め込み編集データ（ルート要素の `content` 属性）を除去します。元の SVG は変更せず、変更検知には元ファイルの hash を使います。Notion から取得した SVG には draw.io の編集データは含まれません。既に同期済みで変更のない画像は自動的には再アップロードしません。画像の表示を保証するものではありません。
+- `sync` または `page sync` に `--drawio-embed` を指定すると、`.drawio.svg` の埋め込み編集データからビューアーの URL を `.notion-sync/<元のファイル名>.txt` に出力し、Notion には空の埋め込みブロックを配置します。テキストファイル内の URL を Notion に手動で貼り付けてください。管理対象の埋め込み URL の変更は差分として扱いません。URL 入力後も、埋め込みの後への本文の追加は既存ブロックを保持して同期します。それ以外で本文の再作成が必要になった場合は、そのページ全体の同期を見送り、手動対応と URL ファイルの場所を警告します。 見出しリンクの更新も見送ります。URL には図のデータ自体が含まれるため、共有先には内容が見えます。URL が 2,000 文字を超える場合は警告を表示します。Notion の画面で長い URL を受け付けない場合は、アクセス可能な場所に図を保存し、短いビューアーリンクを利用してください。出力先に異なる内容のファイルがある場合や、同名の異なる図がある場合は上書きせず停止します。方式の切り替え時と `.drawio.svg` の内容変更時はページ本文が再作成されます。
 - Notion 側の自動削除・アーカイブ、ページ移動、双方向同期、一般の添付ファイルには対応していません。シンボリックリンクは走査しません。
 - 複数データソースを持つ DB と、タイトル以外の必須プロパティがある DB への作成には対応していません。Markdown の変換には [Notion API の制約](https://developers.notion.com/guides/data-apis/working-with-markdown-content) があります。
 - ロックファイルは OS の一時ディレクトリに作業ディレクトリごとに作成します。異常終了後にロックが残った場合は、他のプロセスが動いていないことを確認してからエラーに表示されたファイルを削除してください。

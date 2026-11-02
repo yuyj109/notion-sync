@@ -21,6 +21,19 @@ func TestSyncPullFlags(t *testing.T) {
 	}
 }
 
+func TestSyncPullRejectsDrawioEmbedFromEnvironment(t *testing.T) {
+	t.Setenv("NOTION_SYNC_DRAWIO_EMBED", "true")
+	t.Setenv("NOTION_SYNC_PARENT_ID", "0123456789abcdef0123456789abcdef")
+	root := &cobra.Command{Use: "test", SilenceErrors: true, SilenceUsage: true}
+	opts := runtimeOptions{}
+	opts.addFlags(root)
+	addSyncCommands(root, &opts)
+	root.SetArgs([]string{"sync", "--pull", "--dry-run"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+		t.Fatalf("expected incompatible environment error, got %v", err)
+	}
+}
+
 func TestPushFlagAvailableForDirectoryAndPageSync(t *testing.T) {
 	root := &cobra.Command{Use: "test"}
 	opts := runtimeOptions{}

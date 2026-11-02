@@ -697,7 +697,14 @@ func syncAnchors(ctx context.Context, c config.Config, api Client, s *State, fil
 		if previous != current {
 			return fmt.Errorf("%s: other content changed during anchor update; inspect Notion before retry", patch.path)
 		}
-		e.RemoteHash = remoteMarkdownHash(m.Markdown)
+		baseline := m.Markdown
+		if len(e.managedEmbeds) > 0 {
+			baseline, _, err = normalizeManagedEmbeds(ctx, api, e, baseline)
+			if err != nil {
+				return fmt.Errorf("%s: %w", patch.path, err)
+			}
+		}
+		e.RemoteHash = remoteMarkdownHash(baseline)
 		s.Entries["file:"+patch.path] = e
 		if err := saveState(c, *s); err != nil {
 			return err

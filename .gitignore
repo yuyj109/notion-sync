@@ -2,4 +2,5 @@
 .env.*
 !.env.example
 /notion-sync
+/.notion-sync
 tmp

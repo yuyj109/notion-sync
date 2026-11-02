@@ -10,7 +10,7 @@ import (
 
 func clearSyncEnv(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"NOTION_SYNC_SOURCE", "NOTION_SYNC_PARENT_ID", "NOTION_SYNC_PARENT_TYPE", "NOTION_SYNC_PARENT_PAGE_ID", "NOTION_SYNC_PARENT_DB_ID", "NOTION_SYNC_PRESERVE_HIERARCHY", "NOTION_SYNC_METADATA_FORMAT", "NOTION_SYNC_INCLUDE", "NOTION_SYNC_EXCLUDE"} {
+	for _, key := range []string{"NOTION_SYNC_SOURCE", "NOTION_SYNC_PARENT_ID", "NOTION_SYNC_PARENT_TYPE", "NOTION_SYNC_PARENT_PAGE_ID", "NOTION_SYNC_PARENT_DB_ID", "NOTION_SYNC_PRESERVE_HIERARCHY", "NOTION_SYNC_DRAWIO_EMBED", "NOTION_SYNC_METADATA_FORMAT", "NOTION_SYNC_INCLUDE", "NOTION_SYNC_EXCLUDE"} {
 		value, exists := os.LookupEnv(key)
 		if err := os.Unsetenv(key); err != nil {
 			t.Fatal(err)
@@ -126,6 +126,39 @@ func TestMetadataFormatPrecedence(t *testing.T) {
 	format = "invalid"
 	if _, err := Resolve(opts); err == nil {
 		t.Fatal("invalid metadata format accepted")
+	}
+}
+
+func TestDrawioEmbedPrecedence(t *testing.T) {
+	clearSyncEnv(t)
+	file := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(file, []byte("NOTION_SYNC_DRAWIO_EMBED=true\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	opts := Options{EnvFile: file, FallbackParentID: "0123456789abcdef0123456789abcdef"}
+	c, err := Resolve(opts)
+	if err != nil || !c.Sync.DrawioEmbed {
+		t.Fatalf("dotenv drawio embed = %v, err = %v", c.Sync.DrawioEmbed, err)
+	}
+	t.Setenv("NOTION_SYNC_DRAWIO_EMBED", "false")
+	c, err = Resolve(opts)
+	if err != nil || c.Sync.DrawioEmbed {
+		t.Fatalf("environment drawio embed = %v, err = %v", c.Sync.DrawioEmbed, err)
+	}
+	t.Setenv("NOTION_SYNC_DRAWIO_EMBED", "invalid")
+	if _, err := Resolve(opts); err == nil || !strings.Contains(err.Error(), "NOTION_SYNC_DRAWIO_EMBED") {
+		t.Fatalf("expected invalid value error, got %v", err)
+	}
+	enabled := true
+	opts.DrawioEmbed = &enabled
+	c, err = Resolve(opts)
+	if err != nil || !c.Sync.DrawioEmbed {
+		t.Fatalf("flag must override invalid env value: %v, %v", c.Sync.DrawioEmbed, err)
+	}
+	enabled = false
+	c, err = Resolve(opts)
+	if err != nil || c.Sync.DrawioEmbed {
+		t.Fatalf("explicit false must override env: %v, %v", c.Sync.DrawioEmbed, err)
 	}
 }
 func TestResolvePrecedence(t *testing.T) {

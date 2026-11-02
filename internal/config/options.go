@@ -20,6 +20,7 @@ NOTION_SYNC_PARENT_ID=
 NOTION_SYNC_PARENT_TYPE=auto
 NOTION_SYNC_SOURCE=./docs
 NOTION_SYNC_PRESERVE_HIERARCHY=true
+NOTION_SYNC_DRAWIO_EMBED=false
 NOTION_SYNC_METADATA_FORMAT=frontmatter
 NOTION_SYNC_INCLUDE=**/*.md
 NOTION_SYNC_EXCLUDE=**/node_modules/**
@@ -32,6 +33,7 @@ type Options struct {
 	ParentID          *string
 	ParentType        *string
 	PreserveHierarchy *bool
+	DrawioEmbed       *bool
 	MetadataFormat    *string
 	Include           *[]string
 	Exclude           *[]string
@@ -85,6 +87,13 @@ func Resolve(o Options) (Config, error) {
 		}
 		c.Sync.PreserveHierarchy = b
 	}
+	if v, ok := get("NOTION_SYNC_DRAWIO_EMBED"); ok && o.DrawioEmbed == nil {
+		b, e := strconv.ParseBool(v)
+		if e != nil {
+			return c, fmt.Errorf("invalid NOTION_SYNC_DRAWIO_EMBED: %w", e)
+		}
+		c.Sync.DrawioEmbed = b
+	}
 	if v, ok := get("NOTION_SYNC_INCLUDE"); ok {
 		c.Sync.Include = splitList(v)
 	}
@@ -114,6 +123,9 @@ func Resolve(o Options) (Config, error) {
 	}
 	if o.PreserveHierarchy != nil {
 		c.Sync.PreserveHierarchy = *o.PreserveHierarchy
+	}
+	if o.DrawioEmbed != nil {
+		c.Sync.DrawioEmbed = *o.DrawioEmbed
 	}
 	if o.MetadataFormat != nil {
 		c.Sync.MetadataFormat = *o.MetadataFormat

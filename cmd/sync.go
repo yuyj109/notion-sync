@@ -17,6 +17,9 @@ func addSyncCommands(root *cobra.Command, opts *runtimeOptions) {
 			if pull && (push || overwrite) {
 				return fmt.Errorf("--pull and --push cannot be combined")
 			}
+			if pull && opts.drawioEmbed {
+				return fmt.Errorf("--drawio-embed cannot be combined with --pull")
+			}
 			source := ""
 			if len(args) > 0 {
 				source = args[0]
@@ -27,6 +30,9 @@ func addSyncCommands(root *cobra.Command, opts *runtimeOptions) {
 					return fmt.Errorf("%w\ndirectory sync requires a default parent page or database even when files specify notion-database-id", err)
 				}
 				return err
+			}
+			if pull && c.Sync.DrawioEmbed {
+				return fmt.Errorf("draw.io embed mode cannot be combined with --pull; set --drawio-embed=false to disable it")
 			}
 			if err := resolveParentID(cmd.Context(), &c, notion.Runner{}); err != nil {
 				return err

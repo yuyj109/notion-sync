@@ -14,6 +14,7 @@ import (
 type runtimeOptions struct {
 	envFile, source, parentID, parentType, metadataFormat string
 	preserve                                              bool
+	drawioEmbed                                           bool
 	include, exclude                                      []string
 }
 
@@ -24,6 +25,7 @@ func (o *runtimeOptions) addFlags(root *cobra.Command) {
 	f.StringVar(&o.parentID, "parent-id", "", "default Notion parent page or database ID")
 	f.StringVar(&o.parentType, "parent-type", "auto", "parent type: auto, page, or db")
 	f.BoolVar(&o.preserve, "preserve-hierarchy", true, "reproduce directory hierarchy")
+	f.BoolVar(&o.drawioEmbed, "drawio-embed", false, "export draw.io viewer URLs and create empty embeds")
 	f.StringVar(&o.metadataFormat, "metadata-format", "frontmatter", "metadata format: frontmatter or comment")
 	f.StringSliceVar(&o.include, "include", nil, "include patterns (repeatable or comma-separated)")
 	f.StringSliceVar(&o.exclude, "exclude", nil, "exclude patterns (repeatable or comma-separated)")
@@ -48,6 +50,9 @@ func (o *runtimeOptions) resolve(cmd *cobra.Command, positionalSource, fallbackP
 	}
 	if flags.Changed("preserve-hierarchy") {
 		opts.PreserveHierarchy = &o.preserve
+	}
+	if flags.Changed("drawio-embed") {
+		opts.DrawioEmbed = &o.drawioEmbed
 	}
 	if flags.Changed("metadata-format") {
 		opts.MetadataFormat = &o.metadataFormat

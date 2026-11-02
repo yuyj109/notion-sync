@@ -13,6 +13,7 @@ type Config struct {
 		MetadataFormat    string
 		PreserveHierarchy bool
 		Delete            bool
+		DrawioEmbed       bool
 		Include           []string
 		Exclude           []string
 	}

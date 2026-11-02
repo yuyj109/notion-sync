@@ -407,7 +407,7 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 				diff := makeContentDiff(f.Path, remoteForDiff, f.SyncBody, 0, sourceBodyOffset(f))
 				changed.diff, changed.numberedDiff = diff.Plain, diff.Numbered
 				if len(overwrite) == 0 || !overwrite[0] {
-					return plan, fmt.Errorf("%s: %w", f.Path, err)
+					return plan, fmt.Errorf("%s: %w", f.Path, changed)
 				}
 				conflict = true
 				a.Overwrite = true

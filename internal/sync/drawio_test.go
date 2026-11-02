@@ -30,6 +30,7 @@ type managedEmbedClient struct {
 type updatingEmbedClient struct {
 	*managedEmbedClient
 	patches  int
+	ranges   int
 	warnings []jsonWarning
 }
 
@@ -49,16 +50,30 @@ func (c *embedAndPagesClient) API(ctx context.Context, method, endpoint string, 
 func (c *updatingEmbedClient) API(ctx context.Context, method, endpoint string, body any, out any) error {
 	if method == "PATCH" && strings.HasSuffix(endpoint, "/markdown") {
 		request := body.(map[string]any)
-		if request["type"] != "update_content" {
-			return fmt.Errorf("unexpected markdown update: %v", request["type"])
-		}
-		for _, item := range request["update_content"].(map[string]any)["content_updates"].([]any) {
-			update := item.(map[string]any)
-			old := update["old_str"].(string)
-			if strings.Count(c.markdown, old) != 1 {
-				return fmt.Errorf("ambiguous update")
+		switch request["type"] {
+		case "update_content":
+			for _, item := range request["update_content"].(map[string]any)["content_updates"].([]any) {
+				update := item.(map[string]any)
+				old := update["old_str"].(string)
+				if strings.Count(c.markdown, old) != 1 {
+					return fmt.Errorf("ambiguous update")
+				}
+				c.markdown = strings.Replace(c.markdown, old, update["new_str"].(string), 1)
 			}
-			c.markdown = strings.Replace(c.markdown, old, update["new_str"].(string), 1)
+		case "replace_content_range":
+			update := request["replace_content_range"].(map[string]any)
+			start, end, ok := strings.Cut(update["content_range"].(string), "...")
+			if !ok || strings.Count(c.markdown, start) != 1 || strings.Count(c.markdown, end) != 1 {
+				return fmt.Errorf("ambiguous range")
+			}
+			startAt, endAt := strings.Index(c.markdown, start), strings.Index(c.markdown, end)+len(end)
+			if endAt <= startAt {
+				return fmt.Errorf("invalid range")
+			}
+			c.markdown = c.markdown[:startAt] + update["content"].(string) + c.markdown[endAt:]
+			c.ranges++
+		default:
+			return fmt.Errorf("unexpected markdown update: %v", request["type"])
 		}
 		c.patches++
 	}
@@ -362,11 +377,59 @@ func TestUpdateTextAroundExistingDrawioEmbed(t *testing.T) {
 	if err := Apply(context.Background(), cfg, client, &state, Plan{Actions: []Action{action}}, func(string, ...any) {}); err != nil {
 		t.Fatal(err)
 	}
-	if client.patches != 1 || client.markdown != "# New heading\n<embed src=\"https://example.com/manual\"></embed>\nNew body" {
+	if client.patches != 2 || client.markdown != "# New heading\n<embed src=\"https://example.com/manual\"></embed>\nNew body" {
 		t.Fatalf("unexpected update: patches=%d markdown=%q", client.patches, client.markdown)
 	}
 	if len(state.Skipped) != 0 || state.Entries[action.Key].ImageBlocks["image-1"] != blockID || state.Entries[action.Key].ImageHashes["image-1"] != "old-hash" {
 		t.Fatalf("embed state not preserved: %+v", state.Entries[action.Key])
+	}
+}
+
+func TestDrawioUpdateUsesBoundedRangeForNotionTable(t *testing.T) {
+	cfg, _, dir := setup(t)
+	cfg.Sync.DrawioEmbed = true
+	write(t, filepath.Join(dir, "home.md"), "# Guide\n\n![diagram](diagram.drawio.svg)\n\n- Updated\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nEnd\n")
+	write(t, filepath.Join(dir, "diagram.drawio.svg"), "diagram")
+	files, err := Scan(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := files[0]
+	parts, err := imageTextParts(file.SyncBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockID := "11111111-1111-1111-1111-111111111111"
+	remote := "# Guide\n<embed src=\"https://example.com/manual\"></embed>\n- Old\n<table header-row=\"true\">\n<tr><td>A</td><td>B</td></tr>\n<tr><td>1</td><td>2</td></tr>\n</table>\nEnd"
+	client := &updatingEmbedClient{managedEmbedClient: &managedEmbedClient{markdown: remote, children: []any{map[string]any{"id": blockID, "type": "embed"}}}}
+	entry := Entry{PageID: rootID, ParentID: rootID, ParentType: "page_id", RemoteHash: remoteMarkdownHash(strings.Replace(remote, "https://example.com/manual", "", 1)), ImageBlocks: map[string]string{"image-1": blockID}, ImageHashes: map[string]string{"image-1": "old-hash"}, managedEmbeds: map[string]bool{norm(blockID): true}}
+	state, err := loadState(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Active["home.md"] = true
+	state.Entries["file:home.md"] = entry
+	action := Action{Kind: "update", Key: "file:home.md", Path: "home.md", Entry: entry, File: file, TextParts: parts}
+	if err := Apply(context.Background(), cfg, client, &state, Plan{Actions: []Action{action}}, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	want := "# Guide\n<embed src=\"https://example.com/manual\"></embed>\n" + parts[1]
+	if client.patches != 1 || client.ranges != 1 || client.markdown != want {
+		t.Fatalf("range update failed: patches=%d ranges=%d markdown=%q", client.patches, client.ranges, client.markdown)
+	}
+}
+
+func TestDrawioTextRangeRejectsAmbiguousBoundaries(t *testing.T) {
+	old := "same\n<table>\n<tr>value</tr>\n</table>\nend"
+	remote := old + "\n<embed src=\"url\"></embed>\n" + old
+	if selection, ok := drawioTextRange(remote, old); ok {
+		t.Fatalf("ambiguous range accepted: %q", selection)
+	}
+	old = "- same\n\t- unique child\n<table>value</table>\nunique end"
+	remote = "- same\nother\n<embed src=\"url\"></embed>\n" + old
+	selection, ok := drawioTextRange(remote, old)
+	if !ok || !strings.HasPrefix(selection, "- same\n\t- unique child...") || !strings.HasSuffix(selection, "unique end") || strings.Contains(selection, "<embed") {
+		t.Fatalf("incorrect bounded range: %q (ok=%v)", selection, ok)
 	}
 }
 

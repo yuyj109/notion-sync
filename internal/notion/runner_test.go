@@ -60,6 +60,50 @@ esac
 		t.Fatalf("args=%q", args)
 	}
 }
+
+func TestRunnerUploadSplitsLargeVideo(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "ntn")
+	source := `#!/bin/sh
+case "$*" in
+  *file_uploads/22222222-2222-2222-2222-222222222222/send*)
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--file" ]; then shift; wc -c < "$1" >> "$CAPTURE_DIR/sizes"; fi
+      case "$1" in part_number=*) printf '%s\n' "$1" >> "$CAPTURE_DIR/parts" ;; esac
+      shift
+    done
+    printf '%s\n' '{"object":"file_upload","id":"22222222-2222-2222-2222-222222222222","status":"pending"}' ;;
+  *file_uploads/22222222-2222-2222-2222-222222222222/complete*)
+    printf '%s\n' '{"object":"file_upload","id":"22222222-2222-2222-2222-222222222222","status":"uploaded"}' ;;
+  *) cat > "$CAPTURE_DIR/body"; printf '%s\n' '{"object":"file_upload","id":"22222222-2222-2222-2222-222222222222","status":"pending"}' ;;
+esac
+`
+	if err := os.WriteFile(script, []byte(source), 0700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "clip.mp4")
+	f, err := os.Create(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(20*1024*1024 + 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CAPTURE_DIR", dir)
+	id, err := (Runner{Binary: script}).Upload(context.Background(), "clip.mp4", "video/mp4", file)
+	if err != nil || id != "22222222-2222-2222-2222-222222222222" {
+		t.Fatalf("upload id=%q err=%v", id, err)
+	}
+	body, _ := os.ReadFile(filepath.Join(dir, "body"))
+	parts, _ := os.ReadFile(filepath.Join(dir, "parts"))
+	sizes, _ := os.ReadFile(filepath.Join(dir, "sizes"))
+	if !strings.Contains(string(body), `"mode":"multi_part"`) || !strings.Contains(string(body), `"number_of_parts":3`) || strings.TrimSpace(string(parts)) != "part_number=1\npart_number=2\npart_number=3" || strings.Join(strings.Fields(string(sizes)), ",") != "10485760,10485760,1" {
+		t.Fatalf("incorrect multipart upload: body=%s parts=%s sizes=%s", body, parts, sizes)
+	}
+}
 func TestRunnerRetriesReadRateLimit(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "ntn")

@@ -261,8 +261,8 @@ func matchDiffImages(a, b []diffLine, f *File, e *Entry) bool {
 }
 
 func makeDisplayDiff(filename, remote, local string, oldOffset, newOffset int, includeBlank bool, f *File, e *Entry) DiffOutput {
-	remote = normalizeRemoteImages(redactDisplayURLs(remote), true)
-	local = normalizeRemoteImages(redactDisplayURLs(local), true)
+	remote = normalizeRemoteVideos(normalizeRemoteImages(redactDisplayURLs(remote), true), true)
+	local = normalizeRemoteVideos(normalizeRemoteImages(redactDisplayURLs(local), true), true)
 	a, b := comparableLines(remote, includeBlank), comparableLines(local, includeBlank)
 	normalizeListDiff(a, remote)
 	normalizeListDiff(b, local)

@@ -150,6 +150,15 @@ func resolveLinks(body, filename string, documents map[string]*File, entries map
 		}
 		label := body[start+1 : start+labelEnd]
 		out.WriteString(body[last:start])
+		if u.Fragment != "" {
+			out.WriteString(label)
+			out.WriteString(" - ")
+			out.WriteString(`<mention-page url="`)
+			out.WriteString(pageURL(id))
+			out.WriteString(`"/>`)
+			last = end
+			continue
+		}
 		out.WriteString(`<mention-page url="`)
 		out.WriteString(pageURL(id))
 		out.WriteString(`">`)

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/xml"
 	"fmt"
+	"html"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -161,13 +162,16 @@ func drawioMediaParts(ctx context.Context, api Client, a Action, remote string) 
 	for _, m := range remoteImageRE.FindAllStringIndex(remote, -1) {
 		matches = append(matches, mediaMatch{m[0], m[1], "image"})
 	}
+	for _, m := range remoteVideoRE.FindAllStringIndex(remote, -1) {
+		matches = append(matches, mediaMatch{m[0], m[1], "video"})
+	}
 	sort.Slice(matches, func(i, j int) bool { return matches[i].start < matches[j].start })
 	var blocks []struct {
 		ID   string
 		Type string
 	}
 	for _, child := range children.Results {
-		if child.Type == "embed" || child.Type == "image" {
+		if child.Type == "embed" || child.Type == "image" || child.Type == "video" {
 			blocks = append(blocks, struct {
 				ID   string
 				Type string
@@ -192,6 +196,16 @@ func drawioMediaParts(ctx context.Context, api Client, a Action, remote string) 
 				return nil, nil, false, nil
 			}
 			media = append(media, value)
+		} else if image.ContentType == "video/mp4" {
+			if m.kind != "video" {
+				return nil, nil, false, nil
+			}
+			src := videoSrcRE.FindStringSubmatch(value)
+			block, err := readImageBlock(ctx, api, id)
+			if len(src) < 2 || err != nil || block.Type != "video" || imageMarkdownKey(html.UnescapeString(src[1])) != imageFileKey(mediaBlockURL(block)) {
+				return nil, nil, false, nil
+			}
+			media = append(media, "video:"+id+":"+block.LastEditedTime+":"+imageFileKey(mediaBlockURL(block)))
 		} else {
 			if m.kind != "image" {
 				return nil, nil, false, nil
@@ -224,7 +238,7 @@ func drawioTextUpdates(ctx context.Context, api Client, a Action, remote string)
 	for i := range a.TextParts {
 		old, next := strings.TrimSpace(parts[i]), strings.TrimSpace(a.TextParts[i])
 		if old != next {
-			if old == "" || strings.Contains(next, "<embed") || remoteImageRE.MatchString(next) {
+			if old == "" || strings.Contains(next, "<embed") || remoteImageRE.MatchString(next) || remoteVideoRE.MatchString(next) {
 				return nil, false, nil
 			}
 			update := drawioTextUpdate{Old: old, New: next}
@@ -418,7 +432,7 @@ func identifyManagedDrawioEmbeds(ctx context.Context, api Client, entry *Entry, 
 		switch child.Type {
 		case "embed":
 			entry.managedEmbeds[id] = true
-		case "image":
+		case "image", "video":
 		default:
 			return fmt.Errorf("draw.io block %s has unexpected type %q", child.ID, child.Type)
 		}
@@ -509,7 +523,9 @@ func encodeDrawioXML(data string) (string, error) {
 		result.WriteString("<diagram")
 		for _, attr := range []struct{ name, value string }{{"name", diagram.Name}, {"id", diagram.ID}} {
 			if attr.value != "" {
-				result.WriteString(" " + attr.name + `="`)
+				result.WriteByte(' ')
+				result.WriteString(attr.name)
+				result.WriteString(`="`)
 				if err := xml.EscapeText(&result, []byte(attr.value)); err != nil {
 					return "", err
 				}

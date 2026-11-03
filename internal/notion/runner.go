@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -138,6 +141,72 @@ func (r Runner) API(ctx context.Context, method, path string, body any, result a
 // Upload sends a local file through ntn's documented multipart --file option.
 // The file upload object is created with JSON first, then the file bytes are sent.
 func (r Runner) Upload(ctx context.Context, filename, contentType, localPath string) (string, error) {
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return "", err
+	}
+	const partSize int64 = 10 * 1024 * 1024
+	if info.Size() > 20*1024*1024 {
+		parts := (info.Size() + partSize - 1) / partSize
+		if parts > 1000 {
+			return "", fmt.Errorf("file exceeds the 1000-part upload limit")
+		}
+		var created struct {
+			ID, Object, Status string
+		}
+		body := map[string]any{"filename": filename, "content_type": contentType, "mode": "multi_part", "number_of_parts": parts}
+		if err := r.API(ctx, "POST", "v1/file_uploads", body, &created); err != nil {
+			return "", err
+		}
+		if created.Object != "file_upload" || !strings.Contains(created.ID, "-") {
+			return "", fmt.Errorf("unexpected file upload response")
+		}
+		source, err := os.Open(localPath)
+		if err != nil {
+			return "", err
+		}
+		defer source.Close()
+		dir, err := os.MkdirTemp("", "notion-sync-upload-*")
+		if err != nil {
+			return "", err
+		}
+		defer os.RemoveAll(dir)
+		for part := int64(1); part <= parts; part++ {
+			partFile, err := os.CreateTemp(dir, "part-*"+filepath.Ext(filename))
+			if err != nil {
+				return "", err
+			}
+			size := min(partSize, info.Size()-(part-1)*partSize)
+			_, copyErr := io.CopyN(partFile, source, size)
+			closeErr := partFile.Close()
+			if copyErr != nil {
+				return "", copyErr
+			}
+			if closeErr != nil {
+				return "", closeErr
+			}
+			args := []string{"--verbose", "api", "v1/file_uploads/" + created.ID + "/send", "-X", "POST", "--notion-version", APIVersion, "--file", partFile.Name(), "part_number=" + strconv.FormatInt(part, 10)}
+			out, err := r.command(ctx, nil, args...)
+			if err != nil {
+				return "", err
+			}
+			var sent struct{ ID, Object string }
+			if err := json.Unmarshal(out, &sent); err != nil || sent.Object != "file_upload" || sent.ID != created.ID {
+				return "", fmt.Errorf("unexpected file upload part response")
+			}
+			if err := os.Remove(partFile.Name()); err != nil {
+				return "", err
+			}
+		}
+		var completed struct{ ID, Object, Status string }
+		if err := r.API(ctx, "POST", "v1/file_uploads/"+created.ID+"/complete", map[string]any{}, &completed); err != nil {
+			return "", err
+		}
+		if completed.Object != "file_upload" || completed.ID != created.ID || completed.Status != "uploaded" {
+			return "", fmt.Errorf("unexpected file upload completion response")
+		}
+		return created.ID, nil
+	}
 	var created struct {
 		ID     string `json:"id"`
 		Object string `json:"object"`

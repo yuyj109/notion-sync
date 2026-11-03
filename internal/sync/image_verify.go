@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"fmt"
+	"html"
 	"maps"
 	"net/url"
 	"strings"
@@ -20,6 +21,22 @@ type imageBlock struct {
 			URL string `json:"url"`
 		} `json:"file"`
 	} `json:"image"`
+	Video struct {
+		Type string `json:"type"`
+		File struct {
+			URL string `json:"url"`
+		} `json:"file"`
+	} `json:"video"`
+}
+
+func mediaBlockURL(b imageBlock) string {
+	if b.Type == "video" && b.Video.Type == "file" {
+		return b.Video.File.URL
+	}
+	if b.Type == "image" && b.Image.Type == "file" {
+		return b.Image.File.URL
+	}
+	return ""
 }
 
 // Ignore authentication parameters while retaining resource selectors such as
@@ -62,8 +79,8 @@ func imageMarkdownKey(raw string) string {
 }
 
 func checkedImageBlock(b imageBlock, id string) error {
-	if b.Object != "block" || b.Type != "image" || !config.ValidID(b.ID) || norm(b.ID) != norm(id) || b.Image.Type != "file" || imageFileKey(b.Image.File.URL) == "" || b.LastEditedTime == "" {
-		return fmt.Errorf("unexpected image block response")
+	if b.Object != "block" || (b.Type != "image" && b.Type != "video") || !config.ValidID(b.ID) || norm(b.ID) != norm(id) || imageFileKey(mediaBlockURL(b)) == "" || b.LastEditedTime == "" {
+		return fmt.Errorf("unexpected image or video block response")
 	}
 	return nil
 }
@@ -77,7 +94,7 @@ func readImageBlock(ctx context.Context, api Client, id string) (imageBlock, err
 }
 
 func sameImageBlock(a, b imageBlock) bool {
-	return norm(a.ID) == norm(b.ID) && a.LastEditedTime == b.LastEditedTime && imageFileKey(a.Image.File.URL) == imageFileKey(b.Image.File.URL)
+	return norm(a.ID) == norm(b.ID) && a.Type == b.Type && a.LastEditedTime == b.LastEditedTime && imageFileKey(mediaBlockURL(a)) == imageFileKey(mediaBlockURL(b))
 }
 
 // Match each expected image to exactly one Markdown reference. A block ID
@@ -102,7 +119,7 @@ func matchImageMarkdown(body string, blocks map[string]imageBlock) (string, map[
 		if fragment, ok := strings.CutPrefix(u.Fragment, "notion_record=block."); ok {
 			id := norm(strings.Split(fragment, ".")[0])
 			if block, exists := blocks[id]; exists {
-				if key == "" || key != imageFileKey(block.Image.File.URL) {
+				if block.Type != "image" || key == "" || key != imageFileKey(mediaBlockURL(block)) {
 					return "", nil, fmt.Errorf("image block ID does not match a verifiable file URL")
 				}
 				matched = id
@@ -112,7 +129,7 @@ func matchImageMarkdown(body string, blocks map[string]imageBlock) (string, map[
 			}
 		} else {
 			for id, block := range blocks {
-				if key != "" && key == imageFileKey(block.Image.File.URL) {
+				if block.Type == "image" && key != "" && key == imageFileKey(mediaBlockURL(block)) {
 					if matched != "" {
 						return "", nil, fmt.Errorf("image URLs are ambiguous")
 					}
@@ -128,7 +145,65 @@ func matchImageMarkdown(body string, blocks map[string]imageBlock) (string, map[
 		}
 		seen[matched] = key
 		out.WriteString(body[last:loc[0]])
-		out.WriteString("![" + parts[1] + "](<notion-sync-image:" + matched + ">)" + parts[3])
+		out.WriteString("![")
+		out.WriteString(parts[1])
+		out.WriteString("](<notion-sync-image:")
+		out.WriteString(matched)
+		out.WriteString(">)")
+		out.WriteString(parts[3])
+		last = loc[1]
+	}
+	out.WriteString(body[last:])
+	body = out.String()
+	protected = protectedMarkdown(body)
+	out.Reset()
+	last = 0
+	for _, loc := range remoteVideoRE.FindAllStringIndex(body, -1) {
+		if protected[loc[0]] {
+			continue
+		}
+		value := body[loc[0]:loc[1]]
+		src := videoSrcRE.FindStringSubmatchIndex(value)
+		if src == nil {
+			continue
+		}
+		srcURL := html.UnescapeString(value[src[2]:src[3]])
+		key := imageMarkdownKey(srcURL)
+		var matched string
+		u, err := url.Parse(srcURL)
+		if err != nil {
+			continue
+		}
+		if fragment, ok := strings.CutPrefix(u.Fragment, "notion_record=block."); ok {
+			id := norm(strings.Split(fragment, ".")[0])
+			if block, exists := blocks[id]; exists {
+				if block.Type != "video" || key == "" || key != imageFileKey(mediaBlockURL(block)) {
+					return "", nil, fmt.Errorf("video block ID does not match a verifiable file URL")
+				}
+				matched = id
+			}
+		} else {
+			for id, block := range blocks {
+				if block.Type == "video" && key != "" && key == imageFileKey(mediaBlockURL(block)) {
+					if matched != "" {
+						return "", nil, fmt.Errorf("video URLs are ambiguous")
+					}
+					matched = id
+				}
+			}
+		}
+		if matched == "" {
+			continue
+		}
+		if _, exists := seen[matched]; exists {
+			return "", nil, fmt.Errorf("video reference is ambiguous")
+		}
+		seen[matched] = key
+		out.WriteString(body[last:loc[0]])
+		out.WriteString(value[:src[2]])
+		out.WriteString("notion-sync-video:")
+		out.WriteString(matched)
+		out.WriteString(value[src[3]:])
 		last = loc[1]
 	}
 	out.WriteString(body[last:])
@@ -158,6 +233,9 @@ func prepareImageUpdate(ctx context.Context, api Client, a Action, body string) 
 		b, err := readImageBlock(ctx, api, id)
 		if err != nil {
 			return e, nil, "", nil, fmt.Errorf("%s: cannot inspect image block before updating: %w", a.Path, err)
+		}
+		if (image.ContentType == "video/mp4") != (b.Type == "video") {
+			return e, nil, "", nil, fmt.Errorf("%s: media block type does not match the local file", a.Path)
 		}
 		blocks[norm(id)] = b
 	}

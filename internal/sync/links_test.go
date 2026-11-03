@@ -71,8 +71,18 @@ func TestHeadingLinksBecomePageMentions(t *testing.T) {
 	otherID := "22222222-2222-2222-2222-222222222222"
 	docs := map[string]*File{"a.md": {PageID: selfID}, "b.md": {PageID: otherID}}
 	input := "[self](#missing) [other](./b.md#設定) [missing](./missing.md#x) `[code](./b.md#x)` [query](./b.md?q=1#x)"
-	want := `<mention-page url="` + pageURL(selfID) + `">self</mention-page> <mention-page url="` + pageURL(otherID) + `">other</mention-page> \[missing\](./missing.md#x) ` + "`[code](./b.md#x)`" + ` [query](./b.md?q=1#x)`
+	want := `self - <mention-page url="` + pageURL(selfID) + `"/> other - <mention-page url="` + pageURL(otherID) + `"/> \[missing\](./missing.md#x) ` + "`[code](./b.md#x)`" + ` [query](./b.md?q=1#x)`
 	if got := resolveLinks(input, "a.md", docs, nil); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestHeadingLinkKeepsLabelNextToPageMention(t *testing.T) {
+	id := "22222222-2222-2222-2222-222222222222"
+	docs := map[string]*File{"deployments.md": {PageID: id, SyncBody: "# デプロイ手順\n"}}
+	input := "- [ビルド](./deployments.md#ビルド)\n- [リリース](./deployments.md#リリース)\n"
+	want := "- ビルド - <mention-page url=\"" + pageURL(id) + "\"/>\n- リリース - <mention-page url=\"" + pageURL(id) + "\"/>\n"
+	if got := resolveLinks(input, "home.md", docs, nil); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
@@ -95,7 +105,7 @@ func TestPageSyncDoesNotValidateLinkedPage(t *testing.T) {
 	if err := RunFile(context.Background(), c, api, a, true, func(string, ...any) {}, true); err != nil {
 		t.Fatal(err)
 	}
-	if got := api.pages[norm(aID)].content; !strings.Contains(got, `<mention-page url="`+pageURL(bID)+`">section</mention-page>`) {
+	if got := api.pages[norm(aID)].content; !strings.Contains(got, `section - <mention-page url="`+pageURL(bID)+`"/>`) {
 		t.Fatalf("missing page mention: %s", got)
 	}
 	if api.pages[norm(bID)].content != "# Edited in Notion" {
@@ -116,7 +126,7 @@ func TestSyncMentionsNewPagesWithHeadingLinks(t *testing.T) {
 	}
 	a, b := state.Entries["file:a.md"].PageID, state.Entries["file:b.md"].PageID
 	contentA, contentB := api.pages[norm(a)].content, api.pages[norm(b)].content
-	if !strings.Contains(contentA, `<mention-page url="`+pageURL(a)+`">self</mention-page>`) || !strings.Contains(contentA, `<mention-page url="`+pageURL(b)+`">other</mention-page>`) || !strings.Contains(contentB, `<mention-page url="`+pageURL(a)+`">back</mention-page>`) {
+	if !strings.Contains(contentA, `self - <mention-page url="`+pageURL(a)+`"/>`) || !strings.Contains(contentA, `other - <mention-page url="`+pageURL(b)+`"/>`) || !strings.Contains(contentB, `back - <mention-page url="`+pageURL(a)+`"/>`) {
 		t.Fatalf("new pages were not mentioned: a=%q b=%q", contentA, contentB)
 	}
 }
@@ -145,7 +155,7 @@ func TestSyncMigratesExistingHeadingLinks(t *testing.T) {
 	if err := run(c, api, true); err != nil {
 		t.Fatal(err)
 	}
-	if got := api.pages[norm(a.PageID)].content; strings.Contains(got, "notion-sync-anchor") || !strings.Contains(got, `<mention-page url="`+pageURL(b.PageID)+`">section</mention-page>`) {
+	if got := api.pages[norm(a.PageID)].content; strings.Contains(got, "notion-sync-anchor") || !strings.Contains(got, `section - <mention-page url="`+pageURL(b.PageID)+`"/>`) {
 		t.Fatalf("legacy link was not migrated: %s", got)
 	}
 }
@@ -164,7 +174,7 @@ func TestSyncMentionsNewlyAdoptedPage(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := api.pages[norm(state.Entries["file:a.md"].PageID)].content
-	if !strings.Contains(got, `<mention-page url="`+pageURL(bID)+`">link</mention-page>`) {
+	if !strings.Contains(got, `link - <mention-page url="`+pageURL(bID)+`"/>`) {
 		t.Fatalf("adopted page not mentioned: %s", got)
 	}
 }

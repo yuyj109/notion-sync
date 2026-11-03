@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/url"
 	"os"
@@ -42,7 +43,10 @@ type Image struct {
 }
 
 var localImageRE = regexp.MustCompile(`^!\[([^\]]*)\]\((<[^>]+>|[^\s)]+)(?:\s+"([^"]*)")?\)$`)
+var localVideoLinkRE = regexp.MustCompile(`^\[([^\]]*)\]\((<[^>]+>|[^\s)]+)(?:\s+"([^"]*)")?\)$`)
 var remoteImageRE = regexp.MustCompile(`!\[([^\]]*)\]\((<[^>]+>|[^\s)]+)(\s+"[^"]*")?\)`)
+var remoteVideoRE = regexp.MustCompile(`(?s)<video\b[^>]*(?:/>|>.*?</video>)`)
+var videoSrcRE = regexp.MustCompile(`\bsrc\s*=\s*"([^"]*)"`)
 
 // withoutHTMLComments removes HTML comments while preserving Markdown code examples.
 func withoutHTMLComments(body string) string {
@@ -112,7 +116,30 @@ func remoteMarkdownHash(body string) string {
 }
 
 func canonicalRemoteMarkdown(body string) string {
-	return normalizeRemoteImages(body, false)
+	return normalizeRemoteVideos(normalizeRemoteImages(body, false), false)
+}
+
+func normalizeRemoteVideos(body string, display bool) string {
+	protected := protectedMarkdown(body)
+	var out strings.Builder
+	last := 0
+	for _, loc := range remoteVideoRE.FindAllStringIndex(body, -1) {
+		out.WriteString(body[last:loc[0]])
+		value := body[loc[0]:loc[1]]
+		if !protected[loc[0]] {
+			src := videoSrcRE.FindStringSubmatchIndex(value)
+			if src != nil {
+				u, err := url.Parse(html.UnescapeString(value[src[2]:src[3]]))
+				if err == nil && normalizeImageURL(u, display, 0) {
+					value = value[:src[2]] + html.EscapeString(u.String()) + value[src[3]:]
+				}
+			}
+		}
+		out.WriteString(value)
+		last = loc[1]
+	}
+	out.WriteString(body[last:])
+	return out.String()
 }
 
 // Restrict S3 signature normalization to Notion's own buckets and paths.
@@ -232,14 +259,22 @@ func normalizeRemoteImages(body string, display bool) string {
 		switch {
 		case err != nil:
 			if display {
-				out.WriteString("![" + parts[1] + "](<redacted-invalid-url>)" + parts[3])
+				out.WriteString("![")
+				out.WriteString(parts[1])
+				out.WriteString("](<redacted-invalid-url>)")
+				out.WriteString(parts[3])
 			} else {
 				out.WriteString(value)
 			}
 		case parsed.Scheme == "" && (!display || parsed.Host == "" && parsed.RawQuery == ""):
 			out.WriteString(value)
 		case normalizeImageURL(parsed, display, 0):
-			out.WriteString("![" + parts[1] + "](<" + parsed.String() + ">)" + parts[3])
+			out.WriteString("![")
+			out.WriteString(parts[1])
+			out.WriteString("](<")
+			out.WriteString(parsed.String())
+			out.WriteString(">)")
+			out.WriteString(parts[3])
 		default:
 			out.WriteString(value)
 		}
@@ -267,6 +302,20 @@ func localImages(body, markdownPath, sourceRoot string) ([]Image, error) {
 		}
 		if strings.TrimSpace(body[lineStart:lineEnd]) != body[start:end] {
 			return nil, fmt.Errorf("%s: local images must be standalone Markdown lines with a simple relative path", markdownPath)
+		}
+	}
+	for _, loc := range inlineMarkdownLink.FindAllStringIndex(body, -1) {
+		start, end := loc[0], loc[1]
+		if protected[start] || escapedAt(body, start) || start > 0 && body[start-1] == '!' || !isLocalVideoLink(body[start:end]) {
+			continue
+		}
+		lineStart := strings.LastIndex(body[:start], "\n") + 1
+		lineEnd := len(body)
+		if next := strings.IndexByte(body[end:], '\n'); next >= 0 {
+			lineEnd = end + next
+		}
+		if strings.TrimSpace(body[lineStart:lineEnd]) != body[start:end] {
+			return nil, fmt.Errorf("%s: local videos must be standalone Markdown lines with a simple relative path", markdownPath)
 		}
 	}
 	lines := strings.Split(body, "\n")
@@ -297,6 +346,9 @@ func localImages(body, markdownPath, sourceRoot string) ([]Image, error) {
 			continue
 		}
 		match := localImageRE.FindStringSubmatch(trimmed)
+		if match == nil && isLocalVideoLink(trimmed) {
+			match = localVideoLinkRE.FindStringSubmatch(trimmed)
+		}
 		if match == nil {
 			if strings.HasPrefix(trimmed, "![") && strings.Contains(trimmed, "](") {
 				candidate := trimmed[strings.Index(trimmed, "](")+2:]
@@ -339,10 +391,10 @@ func localImages(body, markdownPath, sourceRoot string) ([]Image, error) {
 			return nil, fmt.Errorf("%s: image %q must be a regular file (symlinks are not followed)", markdownPath, ref)
 		}
 		contentType := imageContentType(filepath.Ext(resolved))
-		if !strings.HasPrefix(contentType, "image/") {
-			return nil, fmt.Errorf("%s: %q is not a supported image file", markdownPath, ref)
+		if !strings.HasPrefix(contentType, "image/") && contentType != "video/mp4" {
+			return nil, fmt.Errorf("%s: %q is not a supported image or MP4 file", markdownPath, ref)
 		}
-		data, err := os.ReadFile(resolved)
+		fileHash, err := hashFile(resolved)
 		if err != nil {
 			return nil, err
 		}
@@ -354,7 +406,7 @@ func localImages(body, markdownPath, sourceRoot string) ([]Image, error) {
 			caption = []any{map[string]any{"type": "text", "text": map[string]any{"content": match[1]}}}
 		}
 		key := fmt.Sprintf("image-%d", len(images)+1)
-		images = append(images, Image{Alt: match[1], Path: filepath.ToSlash(rel), Name: filepath.Base(resolved), ContentType: contentType, Hash: hash(string(data)), Caption: caption, Key: key, SourceLine: trimmed})
+		images = append(images, Image{Alt: match[1], Path: filepath.ToSlash(rel), Name: filepath.Base(resolved), ContentType: contentType, Hash: fileHash, Caption: caption, Key: key, SourceLine: trimmed})
 	}
 	// Goldmark resolves full, collapsed, and shortcut references. Compare its
 	// local image count with the standalone forms we can actually upload so a
@@ -367,6 +419,12 @@ func localImages(body, markdownPath, sourceRoot string) ([]Image, error) {
 				ref := string(img.Destination)
 				u, err := url.Parse(ref)
 				if err == nil && !u.IsAbs() && u.Host == "" && u.Path != "" {
+					localCount++
+				}
+			}
+			if link, ok := node.(*ast.Link); ok {
+				u, err := url.Parse(string(link.Destination))
+				if err == nil && !u.IsAbs() && u.Host == "" && strings.EqualFold(path.Ext(u.Path), ".mp4") {
 					localCount++
 				}
 			}
@@ -391,6 +449,8 @@ func imageContentType(ext string) string {
 		return "image/webp"
 	case ".svg":
 		return "image/svg+xml"
+	case ".mp4":
+		return "video/mp4"
 	default:
 		return ""
 	}
@@ -424,7 +484,7 @@ func bodyWithoutImages(body string) (string, []int, error) {
 				continue
 			}
 		}
-		if fence == 0 && localImageRE.MatchString(trimmed) && isLocalImage(trimmed) {
+		if fence == 0 && isLocalImage(trimmed) {
 			indices = append(indices, i)
 			continue
 		}
@@ -439,10 +499,19 @@ func bodyWithoutImages(body string) (string, []int, error) {
 func isLocalImage(line string) bool {
 	match := localImageRE.FindStringSubmatch(strings.TrimSpace(line))
 	if match == nil {
-		return false
+		return isLocalVideoLink(line)
 	}
 	ref := strings.Trim(match[2], "<>")
 	return !strings.Contains(ref, "://") && !strings.HasPrefix(ref, "data:") && !strings.HasPrefix(ref, "#") && !strings.HasPrefix(ref, "//")
+}
+
+func isLocalVideoLink(line string) bool {
+	match := localVideoLinkRE.FindStringSubmatch(strings.TrimSpace(line))
+	if match == nil {
+		return false
+	}
+	u, err := url.Parse(strings.Trim(match[2], "<>"))
+	return err == nil && !u.IsAbs() && u.Host == "" && u.Path != "" && strings.EqualFold(path.Ext(u.Path), ".mp4")
 }
 
 func imageTextParts(body string) ([]string, error) {
@@ -522,6 +591,19 @@ func protectedImageLines(body string) map[int]bool {
 }
 
 func hash(s string) string { sum := sha256.Sum256([]byte(s)); return hex.EncodeToString(sum[:]) }
+
+func hashFile(filename string) (string, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
 
 func imageHashMap(images []Image) map[string]string {
 	result := make(map[string]string, len(images))

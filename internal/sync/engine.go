@@ -532,7 +532,13 @@ func appendImages(ctx context.Context, api Client, pageID string, action Action,
 			if err != nil {
 				return nil, fmt.Errorf("%s: image upload outcome uncertain; inspect Notion before retry: %w", action.Path, err)
 			}
-			child = map[string]any{"object": "block", "type": "image", "image": map[string]any{"type": "file_upload", "file_upload": map[string]any{"id": uploadID}, "caption": image.Caption}}
+			if err := verifyImageUnchanged(full, image.Hash); err != nil {
+				return nil, fmt.Errorf("%s: file changed during upload; inspect Notion before retrying: %w", action.Path, err)
+			}
+			if image.ContentType == "video/mp4" {
+				blockType = "video"
+			}
+			child = map[string]any{"object": "block", "type": blockType, blockType: map[string]any{"type": "file_upload", "file_upload": map[string]any{"id": uploadID}, "caption": image.Caption}}
 		}
 		var result struct {
 			Results []struct {
@@ -576,6 +582,11 @@ func ensureImageBlockIDs(ctx context.Context, api Client, pageID, path string, a
 						PlainText string `json:"plain_text"`
 					} `json:"caption"`
 				} `json:"image"`
+				Video struct {
+					Caption []struct {
+						PlainText string `json:"plain_text"`
+					} `json:"caption"`
+				} `json:"video"`
 			} `json:"results"`
 			HasMore bool `json:"has_more"`
 		}
@@ -584,7 +595,7 @@ func ensureImageBlockIDs(ctx context.Context, api Client, pageID, path string, a
 		}
 		var ids []string
 		for _, child := range children.Results {
-			if child.Type == "image" {
+			if child.Type == "image" || child.Type == "video" {
 				ids = append(ids, child.ID)
 			}
 		}
@@ -598,7 +609,14 @@ func ensureImageBlockIDs(ctx context.Context, api Client, pageID, path string, a
 				var caption strings.Builder
 				for _, child := range children.Results {
 					if child.ID == ids[i] {
-						for _, part := range child.Image.Caption {
+						if (image.ContentType == "video/mp4") != (child.Type == "video") {
+							return fmt.Errorf("%s: existing media block types do not match local files", path)
+						}
+						parts := child.Image.Caption
+						if child.Type == "video" {
+							parts = child.Video.Caption
+						}
+						for _, part := range parts {
 							caption.WriteString(part.PlainText)
 						}
 						break
@@ -642,12 +660,19 @@ func replaceImages(ctx context.Context, api Client, pageID string, action Action
 		}
 		// Update-block requests differ from append-children requests: the nested
 		// image object accepts file_upload directly and rejects a nested `type`.
-		body := map[string]any{"type": "image", "image": map[string]any{"file_upload": map[string]any{"id": uploadID}, "caption": image.Caption}}
+		kind := "image"
+		if image.ContentType == "video/mp4" {
+			kind = "video"
+		}
+		if err := verifyImageUnchanged(full, image.Hash); err != nil {
+			return fmt.Errorf("%s: file changed during upload; inspect Notion before retrying: %w", action.Path, err)
+		}
+		body := map[string]any{"type": kind, kind: map[string]any{"file_upload": map[string]any{"id": uploadID}, "caption": image.Caption}}
 		var result imageBlock
 		if err := api.API(ctx, "PATCH", "v1/blocks/"+blockID, body, &result); err != nil {
 			return fmt.Errorf("%s: image replacement outcome uncertain; inspect Notion before retry: %w", action.Path, err)
 		}
-		if err := checkedImageBlock(result, blockID); err != nil || imageFileKey(result.Image.File.URL) == imageFileKey(current.Image.File.URL) {
+		if err := checkedImageBlock(result, blockID); err != nil || result.Type != kind || imageFileKey(mediaBlockURL(result)) == imageFileKey(mediaBlockURL(current)) {
 			return fmt.Errorf("%s: image update response does not identify a new file; inspect Notion before retrying", action.Path)
 		}
 		updated[norm(blockID)] = result
@@ -667,14 +692,23 @@ func verifyImageUnchanged(filename, expected string) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("image is no longer a regular file")
 	}
-	data, err := os.ReadFile(filename)
+	actual, err := hashFile(filename)
 	if err != nil {
 		return err
 	}
-	if hash(string(data)) != expected {
+	if actual != expected {
 		return fmt.Errorf("image changed during sync; run diff again before retrying")
 	}
 	return nil
+}
+
+func mediaLabel(images []Image) string {
+	for _, image := range images {
+		if image.ContentType == "video/mp4" {
+			return "media"
+		}
+	}
+	return "images"
 }
 
 func printPlan(p Plan, print func(string, ...any)) {
@@ -707,21 +741,21 @@ func printPlan(p Plan, print func(string, ...any)) {
 				}
 			case a.Kind == "images-update":
 				images := changedUnmanagedImages(a.File.Images, a.Entry)
-				print("update images (%d) %s -> %s", len(images), a.Path, destination)
+				print("update %s (%d) %s -> %s", mediaLabel(images), len(images), a.Path, destination)
 			case len(a.File.Images) > 0 && (a.Kind == "unchanged" || a.Kind == "normalize"):
 				changed := changedUnmanagedImages(a.File.Images, a.Entry)
 				switch {
 				case len(changed) > 0:
-					print("%s %s -> %s (images changed: %d)", a.Kind, a.Path, destination, len(changed))
+					print("%s %s -> %s (%s changed: %d)", a.Kind, a.Path, destination, mediaLabel(changed), len(changed))
 				case len(a.Entry.managedEmbeds) > 0:
 					print("%s %s -> %s (draw.io embeds preserved)", a.Kind, a.Path, destination)
 				default:
-					print("%s %s -> %s (images unchanged: %d; not uploaded)", a.Kind, a.Path, destination, len(a.File.Images))
+					print("%s %s -> %s (%s unchanged: %d; not uploaded)", a.Kind, a.Path, destination, mediaLabel(a.File.Images), len(a.File.Images))
 				}
 			case a.Kind == "update" && len(a.Entry.managedEmbeds) > 0:
 				print("update %s -> %s (draw.io embeds checked before updating)", a.Path, destination)
 			case a.Kind == "update" && len(a.File.Images) > 0:
-				print("%s %s -> %s (images replaced: %d)", a.Kind, a.Path, destination, len(a.File.Images))
+				print("%s %s -> %s (%s replaced: %d)", a.Kind, a.Path, destination, mediaLabel(a.File.Images), len(a.File.Images))
 			default:
 				print("%s %s -> %s", a.Kind, a.Path, destination)
 			}
@@ -816,7 +850,7 @@ func validatePlannedImageSizes(c config.Config, p Plan) error {
 			if err != nil {
 				return err
 			}
-			if info.Size() > 20*1024*1024 {
+			if info.Size() > 20*1024*1024 && img.ContentType != "video/mp4" {
 				return fmt.Errorf("%s: image %s exceeds the 20 MB single-part upload limit", action.Path, img.Path)
 			}
 		}
@@ -965,7 +999,7 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 				if err != nil {
 					return err
 				}
-				if info.Size() > 20*1024*1024 {
+				if info.Size() > 20*1024*1024 && img.ContentType != "video/mp4" {
 					return fmt.Errorf("%s: image %s exceeds the 20 MB single-part upload limit", action.Path, img.Path)
 				}
 			}
@@ -1165,7 +1199,7 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 			if err := saveState(c, *s); err != nil {
 				return err
 			}
-			print("updated images (%d) %s -> %s", len(images), a.Path, pageURL(e.PageID))
+			print("updated %s (%d) %s -> %s", mediaLabel(images), len(images), a.Path, pageURL(e.PageID))
 		case "normalize":
 			f := s.Documents[a.Path]
 			if err := writeMetadata(c, f, f.Metadata); err != nil {
@@ -1293,7 +1327,7 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 				return err
 			}
 			if len(a.File.Images) > 0 {
-				print("updated %s -> %s (images replaced: %d)", a.Path, pageURL(e.PageID), len(a.File.Images))
+				print("updated %s -> %s (%s replaced: %d)", a.Path, pageURL(e.PageID), mediaLabel(a.File.Images), len(a.File.Images))
 			} else {
 				print("updated %s -> %s", a.Path, pageURL(e.PageID))
 			}

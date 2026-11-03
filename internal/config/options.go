@@ -12,6 +12,7 @@ import (
 )
 
 const DefaultEnvFile = ".env"
+const DefaultMetadataFormat = "comment"
 
 var ErrParentRequired = errors.New("parent page or database ID is required; use --parent-id or NOTION_SYNC_PARENT_ID")
 
@@ -21,7 +22,7 @@ NOTION_SYNC_PARENT_TYPE=auto
 NOTION_SYNC_SOURCE=./docs
 NOTION_SYNC_PRESERVE_HIERARCHY=true
 NOTION_SYNC_DRAWIO_EMBED=false
-NOTION_SYNC_METADATA_FORMAT=frontmatter
+NOTION_SYNC_METADATA_FORMAT=comment
 NOTION_SYNC_INCLUDE=**/*.md
 NOTION_SYNC_EXCLUDE=**/node_modules/**
 `
@@ -52,7 +53,7 @@ func Resolve(o Options) (Config, error) {
 	c.Source = "./docs"
 	c.Sync.Direction = "push"
 	c.Notion.ParentType = "auto"
-	c.Sync.MetadataFormat = "frontmatter"
+	c.Sync.MetadataFormat = DefaultMetadataFormat
 	c.Sync.PreserveHierarchy = true
 	c.Sync.Include = []string{"**/*.md"}
 	c.Sync.Exclude = []string{"**/node_modules/**"}

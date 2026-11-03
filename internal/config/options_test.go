@@ -104,11 +104,18 @@ func TestUnifiedParentDotenv(t *testing.T) {
 func TestMetadataFormatPrecedence(t *testing.T) {
 	clearSyncEnv(t)
 	file := filepath.Join(t.TempDir(), ".env")
+	opts := Options{EnvFile: file, FallbackParentID: "0123456789abcdef0123456789abcdef"}
+	c, err := Resolve(opts)
+	if err != nil || c.Sync.MetadataFormat != "comment" {
+		t.Fatalf("default format = %q, err = %v", c.Sync.MetadataFormat, err)
+	}
+	if !strings.Contains(EnvExample, "NOTION_SYNC_METADATA_FORMAT=comment\n") {
+		t.Fatal("init template does not use comment format")
+	}
 	if err := os.WriteFile(file, []byte("NOTION_SYNC_METADATA_FORMAT=comment\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	opts := Options{EnvFile: file, FallbackParentID: "0123456789abcdef0123456789abcdef"}
-	c, err := Resolve(opts)
+	c, err = Resolve(opts)
 	if err != nil || c.Sync.MetadataFormat != "comment" {
 		t.Fatalf("dotenv format = %q, err = %v", c.Sync.MetadataFormat, err)
 	}

@@ -571,13 +571,33 @@ func drawioViewerURL(data []byte, filename string) ([]byte, error) {
 
 func exportDrawioURL(c config.Config, p Plan, write bool, print func(string, ...any)) error {
 	outputs := map[string][]byte{}
+	var dir string
 	for _, action := range p.Actions {
 		for _, image := range action.File.Images {
 			if !isDrawioSVG(image) {
 				continue
 			}
+			restore := false
 			if !action.ForceReplace && action.Entry.managedEmbeds[norm(action.Entry.ImageBlocks[imageStateKey(image)])] {
-				continue
+				// A changed diagram may no longer match the URL in the existing embed.
+				if action.Entry.ImageHashes[imageStateKey(image)] != hash("drawio-embed:"+image.Hash) {
+					continue
+				}
+				if dir == "" {
+					var err error
+					dir, err = sharedStateDir(c.SourcePath)
+					if err != nil {
+						return fmt.Errorf("locate draw.io output directory: %w", err)
+					}
+				}
+				_, err := os.Lstat(filepath.Join(dir, image.Name+".txt"))
+				if err == nil {
+					continue // Preserve the existing URL file, regardless of its contents.
+				}
+				if !os.IsNotExist(err) {
+					return err
+				}
+				restore = true
 			}
 			filename := filepath.Join(c.SourcePath, filepath.FromSlash(image.Path))
 			if err := verifyImageUnchanged(filename, image.Hash); err != nil {
@@ -592,6 +612,12 @@ func exportDrawioURL(c config.Config, p Plan, write bool, print func(string, ...
 			}
 			content, err := drawioViewerURL(data, image.Name)
 			if err != nil {
+				if restore {
+					if print != nil {
+						print("warning %s: cannot restore draw.io viewer URL: %v", image.Path, err)
+					}
+					continue
+				}
 				return fmt.Errorf("%s: %w", image.Path, err)
 			}
 			if len(content)-1 > 2000 && print != nil {
@@ -607,7 +633,24 @@ func exportDrawioURL(c config.Config, p Plan, write bool, print func(string, ...
 	if len(outputs) == 0 {
 		return nil
 	}
-	dir := filepath.Join(c.WorkDir, ".notion-sync")
+	if dir == "" {
+		var err error
+		dir, err = sharedStateDir(c.SourcePath)
+		if err != nil {
+			return fmt.Errorf("locate draw.io output directory: %w", err)
+		}
+	}
+	if print != nil {
+		print("draw.io viewer URL output directory: %s", dir)
+		names := make([]string, 0, len(outputs))
+		for name := range outputs {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			print("draw.io viewer URL output: %s", filepath.Join(dir, name))
+		}
+	}
 	info, err := os.Lstat(dir)
 	if os.IsNotExist(err) {
 		if !write {
@@ -663,6 +706,9 @@ func exportDrawioURL(c config.Config, p Plan, write bool, print func(string, ...
 		}
 		if closeErr != nil {
 			return closeErr
+		}
+		if print != nil {
+			print("draw.io viewer URL: %s", strings.TrimSuffix(string(content), "\n"))
 		}
 	}
 	return nil

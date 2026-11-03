@@ -235,7 +235,7 @@ func TestSyncNewDatabasePageWritesPropertiesAndFrontmatter(t *testing.T) {
 	c, base, dir := setup(t)
 	c.Notion.ParentDatabaseID = "11111111-1111-1111-1111-111111111111"
 	c.Notion.ParentPageID = ""
-	c.Sync.MetadataFormat = "comment"
+	c.Sync.MetadataFormat = ""
 	c.Sync.Properties = map[string]string{"Status": "Done", "Description": "Hello World"}
 	ds := "22222222-2222-2222-2222-222222222222"
 	client := &propertySyncClient{fakeAPI: base, db: c.Notion.ParentDatabaseID, ds: ds, values: map[string]map[string]json.RawMessage{}}
@@ -257,7 +257,109 @@ func TestSyncNewDatabasePageWritesPropertiesAndFrontmatter(t *testing.T) {
 	if parsed.Properties["Description"] != "Hello World" || parsed.Properties["Status"] != "Done" || parsed.Metadata == nil {
 		t.Fatalf("unexpected result: %+v", parsed)
 	}
+	if !strings.HasPrefix(string(mustRead(t, file)), "<!-- notion-sync\n") || parsed.PropertiesFormat != "comment" {
+		t.Fatalf("properties not saved in comment: %s", mustRead(t, file))
+	}
 	if len(client.values[norm(parsed.PageID)]) != 2 {
 		t.Fatalf("page properties: %v", client.values)
+	}
+	before := string(mustRead(t, file))
+	if err := Run(context.Background(), c, client, true, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	if string(mustRead(t, file)) != before {
+		t.Fatal("repeated sync changed metadata")
+	}
+}
+
+func TestPropertyFormatConversion(t *testing.T) {
+	for _, initial := range []string{"frontmatter", "comment"} {
+		t.Run(initial, func(t *testing.T) {
+			c, base, dir := setup(t)
+			c.Notion.ParentDatabaseID, c.Notion.ParentPageID = "11111111-1111-1111-1111-111111111111", ""
+			c.Sync.MetadataFormat = initial
+			c.Sync.Properties = map[string]string{"Status": "Done"}
+			client := &propertySyncClient{fakeAPI: base, db: c.Notion.ParentDatabaseID, ds: "22222222-2222-2222-2222-222222222222", values: map[string]map[string]json.RawMessage{}}
+			file := filepath.Join(dir, "note.md")
+			write(t, file, "---\ntitle: Keep\n---\n# Hello\n")
+			if err := Run(context.Background(), c, client, true, func(string, ...any) {}); err != nil {
+				t.Fatal(err)
+			}
+			before := string(mustRead(t, file))
+			if initial == "comment" {
+				c.Sync.MetadataFormat = "frontmatter"
+			} else {
+				c.Sync.MetadataFormat = "comment"
+			}
+			var preview strings.Builder
+			if err := Run(context.Background(), c, client, false, func(format string, args ...any) { fmt.Fprintf(&preview, format+"\n", args...) }); err != nil {
+				t.Fatal(err)
+			}
+			if string(mustRead(t, file)) != before || !strings.Contains(preview.String(), "move local properties") {
+				t.Fatalf("invalid preview: %s", preview.String())
+			}
+			if err := Run(context.Background(), c, client, true, func(string, ...any) {}); err != nil {
+				t.Fatal(err)
+			}
+			got, err := parse(mustRead(t, file))
+			if err != nil || got.PropertiesFormat != c.Sync.MetadataFormat || got.Properties["Status"] != "Done" || got.Body != "# Hello\n" {
+				t.Fatalf("conversion: %+v %v", got, err)
+			}
+		})
+	}
+}
+
+func TestPropertyCommentDuplicateAndUnsafeValue(t *testing.T) {
+	if _, err := parse([]byte("---\nnotion-properties: {Status: Done}\n---\n<!-- notion-sync\nnotion-properties: {Status: Todo}\n-->\nBody\n")); err == nil {
+		t.Fatal("duplicate properties accepted")
+	}
+	if _, err := renderPropertyMetadata([]byte("Body\n"), map[string]string{"Description": "unsafe --> content"}, "comment"); err == nil {
+		t.Fatal("comment terminator accepted")
+	}
+}
+
+func TestLegacySplitPropertyLocationIsMigrated(t *testing.T) {
+	c, base, dir := setup(t)
+	c.Notion.ParentDatabaseID, c.Notion.ParentPageID = "11111111-1111-1111-1111-111111111111", ""
+	c.Sync.MetadataFormat = "comment"
+	c.Sync.Properties = map[string]string{"Status": "Done"}
+	client := &propertySyncClient{fakeAPI: base, db: c.Notion.ParentDatabaseID, ds: "22222222-2222-2222-2222-222222222222", values: map[string]map[string]json.RawMessage{}}
+	file := filepath.Join(dir, "note.md")
+	write(t, file, "---\ntitle: Keep\n---\n# Hello\n")
+	if err := Run(context.Background(), c, client, true, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	original := string(mustRead(t, file))
+	legacy := strings.Replace(original, "notion-properties:\n  Status: Done\n", "", 1)
+	if legacy == original {
+		t.Fatalf("missing properties: %s", original)
+	}
+	legacy = strings.Replace(legacy, "title: Keep\n", "title: Keep\nnotion-properties:\n  Status: Done\n", 1)
+	write(t, file, legacy)
+	var preview strings.Builder
+	if err := Run(context.Background(), c, client, false, func(format string, args ...any) { fmt.Fprintf(&preview, format+"\n", args...) }); err != nil {
+		t.Fatal(err)
+	}
+	if string(mustRead(t, file)) != legacy || !strings.Contains(preview.String(), "move local properties") {
+		t.Fatalf("legacy migration preview: %s", preview.String())
+	}
+	if err := Run(context.Background(), c, client, true, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := parse(mustRead(t, file))
+	if err != nil || got.PropertiesFormat != "comment" || got.Properties["Status"] != "Done" {
+		t.Fatalf("legacy migration: %+v %v", got, err)
+	}
+}
+
+func TestResetPreservesCommentProperties(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "note.md")
+	write(t, file, "<!-- notion-sync\nnotion-page-id: 11111111-1111-1111-1111-111111111111\nnotion-properties:\n  Status: Done\n-->\nBody\n")
+	if err := Reset(file, false, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := parse(mustRead(t, file))
+	if err != nil || got.PropertiesFormat != "comment" || got.Properties["Status"] != "Done" || got.PageID != "" || got.Body != "Body\n" {
+		t.Fatalf("reset: %+v %v", got, err)
 	}
 }

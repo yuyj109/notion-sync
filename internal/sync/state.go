@@ -172,9 +172,9 @@ func saveState(c config.Config, s State) error {
 		}
 		format := c.Sync.MetadataFormat
 		if format == "" {
-			format = "frontmatter"
+			format = config.DefaultMetadataFormat
 		}
-		if reflect.DeepEqual(f.Metadata, &m) && f.MetadataFormat == format {
+		if reflect.DeepEqual(f.Metadata, &m) && f.MetadataFormat == format && !f.MetadataOrderNeedsFormatting && (f.PropertiesFormat == "" || f.PropertiesFormat == format) {
 			continue
 		}
 		if err := writeMetadata(c, f, &m); err != nil {
@@ -227,7 +227,7 @@ func writeMetadataBody(c config.Config, f *File, m *Metadata, replacement *strin
 	}
 	format := c.Sync.MetadataFormat
 	if format == "" {
-		format = "frontmatter"
+		format = config.DefaultMetadataFormat
 	}
 	result, err := renderMetadata(root, body, nl, format, current)
 	if err != nil {
@@ -262,7 +262,11 @@ func writeMetadataBody(c config.Config, f *File, m *Metadata, replacement *strin
 	f.Raw = result
 	f.Metadata = m
 	f.MetadataFormat = format
+	if f.PropertiesFormat != "" {
+		f.PropertiesFormat = format
+	}
 	f.RootNeedsFormatting = false
+	f.MetadataOrderNeedsFormatting = false
 	if m.Entry != nil {
 		f.PageID = m.Entry.PageID
 	}
@@ -291,6 +295,13 @@ func replaceUnchangedFile(filename, temporary string, expected []byte, original 
 }
 
 func renderMetadata(root *yaml.Node, body, nl, format string, original []byte) ([]byte, error) {
+	orderMetadataKeys(root.Content[0])
+	validate := func(result []byte) ([]byte, error) {
+		if _, _, _, err := frontmatter(result); err != nil {
+			return nil, fmt.Errorf("cannot safely write reordered metadata: %w", err)
+		}
+		return result, nil
+	}
 	encode := func(node *yaml.Node) (string, error) {
 		var buf bytes.Buffer
 		enc := yaml.NewEncoder(&buf)
@@ -308,7 +319,7 @@ func renderMetadata(root *yaml.Node, body, nl, format string, original []byte) (
 		if err != nil {
 			return nil, err
 		}
-		return []byte("---" + nl + header + nl + "---" + nl + body), nil
+		return validate([]byte("---" + nl + header + nl + "---" + nl + body))
 	}
 	if format != "comment" {
 		return nil, fmt.Errorf("invalid metadata format %q", format)
@@ -348,7 +359,7 @@ func renderMetadata(root *yaml.Node, body, nl, format string, original []byte) (
 	if strings.Contains(header, "-->") {
 		return nil, fmt.Errorf("metadata cannot contain --> in comment format")
 	}
-	return []byte(prefix + "<!-- notion-sync" + nl + header + nl + "-->" + nl + body), nil
+	return validate([]byte(prefix + "<!-- notion-sync" + nl + header + nl + "-->" + nl + body))
 }
 func lock() (func(), error) {
 	// A single lock also covers overlapping source roots, reset, and recover.

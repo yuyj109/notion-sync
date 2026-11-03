@@ -348,7 +348,7 @@ func planProperties(ctx context.Context, c config.Config, api Client, p *Plan, s
 			if input, exists := c.Sync.Properties[name]; exists {
 				if old, exists := a.File.Properties[name]; !exists || !reflect.DeepEqual(old, input) {
 					plan.local[name] = input
-					plan.preview = append(plan.preview, fmt.Sprintf("frontmatter %s = %q", name, input))
+					plan.preview = append(plan.preview, fmt.Sprintf("local property %s = %q", name, input))
 				}
 			}
 			if a.Entry.PageID != "" {
@@ -369,29 +369,27 @@ func planProperties(ctx context.Context, c config.Config, api Client, p *Plan, s
 				plan.preview = append(plan.preview, fmt.Sprintf("set database property %s = %v", name, values[name]))
 			}
 		}
+		format := c.Sync.MetadataFormat
+		if format == "" {
+			format = config.DefaultMetadataFormat
+		}
+		if len(plan.local) > 0 || a.File.PropertiesFormat != "" && a.File.PropertiesFormat != format {
+			if _, err := renderPropertyMetadata(a.File.Raw, plan.local, format); err != nil {
+				return fmt.Errorf("%s: prepare local properties: %w", a.Path, err)
+			}
+			if a.File.PropertiesFormat != "" && a.File.PropertiesFormat != format {
+				plan.preview = append(plan.preview, "move local properties to "+format)
+			}
+		}
 		a.propertyPlan = plan
 	}
 	return nil
 }
 
-func writePropertyFrontmatter(c config.Config, f *File, updates map[string]string) error {
-	if len(updates) == 0 {
-		return nil
-	}
-	filename := filepath.Join(c.SourcePath, filepath.FromSlash(f.Path))
-	info, err := os.Lstat(filename)
+func renderPropertyMetadata(raw []byte, updates map[string]string, format string) ([]byte, error) {
+	root, body, nl, err := frontmatter(raw)
 	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("%s is not a regular file", f.Path)
-	}
-	if err = verifyFileUnchanged(c, f); err != nil {
-		return err
-	}
-	root, body, nl, err := yamlFrontmatter(f.Raw)
-	if err != nil {
-		return err
+		return nil, err
 	}
 	mapping := root.Content[0]
 	var props *yaml.Node
@@ -406,7 +404,7 @@ func writePropertyFrontmatter(c config.Config, f *File, updates map[string]strin
 		mapping.Content = append(mapping.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "notion-properties"}, props)
 	}
 	if props.Kind != yaml.MappingNode {
-		return fmt.Errorf("notion-properties must be a mapping")
+		return nil, fmt.Errorf("notion-properties must be a mapping")
 	}
 	names := make([]string, 0, len(updates))
 	for k := range updates {
@@ -427,17 +425,32 @@ func writePropertyFrontmatter(c config.Config, f *File, updates map[string]strin
 			props.Content = append(props.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: k}, v)
 		}
 	}
-	var buf bytes.Buffer
-	enc := yaml.NewEncoder(&buf)
-	enc.SetIndent(2)
-	if err = enc.Encode(root); err != nil {
+	return renderMetadata(root, body, nl, format, raw)
+}
+
+func writePropertyFrontmatter(c config.Config, f *File, updates map[string]string) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	filename := filepath.Join(c.SourcePath, filepath.FromSlash(f.Path))
+	info, err := os.Lstat(filename)
+	if err != nil {
 		return err
 	}
-	if err = enc.Close(); err != nil {
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", f.Path)
+	}
+	if err = verifyFileUnchanged(c, f); err != nil {
 		return err
 	}
-	header := strings.ReplaceAll(strings.TrimSuffix(buf.String(), "\n"), "\n", nl)
-	result := []byte("---" + nl + header + nl + "---" + nl + body)
+	format := c.Sync.MetadataFormat
+	if format == "" {
+		format = config.DefaultMetadataFormat
+	}
+	result, err := renderPropertyMetadata(f.Raw, updates, format)
+	if err != nil {
+		return err
+	}
 	tmp, err := os.CreateTemp(filepath.Dir(filename), ".notion-sync-*")
 	if err != nil {
 		return err
@@ -460,6 +473,9 @@ func writePropertyFrontmatter(c config.Config, f *File, updates map[string]strin
 		return err
 	}
 	f.Raw = result
+	f.MetadataFormat = format
+	f.PropertiesFormat = format
+	f.MetadataOrderNeedsFormatting = false
 	if f.Properties == nil {
 		f.Properties = map[string]any{}
 	}
@@ -472,10 +488,10 @@ func writePropertyFrontmatter(c config.Config, f *File, updates map[string]strin
 func applyProperties(ctx context.Context, c config.Config, api Client, s *State, a Action, print func(string, ...any)) error {
 	p := a.propertyPlan
 	if err := writePropertyFrontmatter(c, s.Documents[a.Path], p.local); err != nil {
-		return fmt.Errorf("%s: write frontmatter: %w", a.Path, err)
+		return fmt.Errorf("%s: write local properties: %w", a.Path, err)
 	}
 	if len(p.local) > 0 {
-		print("updated frontmatter: %s", a.Path)
+		print("updated local properties: %s", a.Path)
 	}
 	if a.Entry.PageID == "" || len(p.write) == 0 {
 		return nil

@@ -342,6 +342,17 @@ func build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 		if progress != nil {
 			progress("checking page %d/%d: %s", i+1, len(files), f.Path)
 		}
+		root, body, nl, err := frontmatter(f.Raw)
+		if err != nil {
+			return plan, fmt.Errorf("%s: %w", f.Path, err)
+		}
+		format := c.Sync.MetadataFormat
+		if format == "" {
+			format = config.DefaultMetadataFormat
+		}
+		if _, err := renderMetadata(root, body, nl, format, f.Raw); err != nil {
+			return plan, fmt.Errorf("%s: prepare metadata: %w", f.Path, err)
+		}
 		for i := range f.Images {
 			if c.Sync.DrawioEmbed && isDrawioSVG(f.Images[i]) {
 				f.Images[i].StateHash = hash("drawio-embed:" + f.Images[i].Hash)
@@ -483,9 +494,9 @@ func build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 				}
 				format := c.Sync.MetadataFormat
 				if format == "" {
-					format = "frontmatter"
+					format = config.DefaultMetadataFormat
 				}
-				if f.RootNeedsFormatting || f.Metadata != nil && f.MetadataFormat != format {
+				if f.RootNeedsFormatting || f.Metadata != nil && (f.MetadataFormat != format || f.MetadataOrderNeedsFormatting || f.PropertiesFormat != "" && f.PropertiesFormat != format) {
 					if a.Kind == "unchanged" {
 						a.Kind = "normalize"
 					}
@@ -1555,6 +1566,9 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 }
 func Run(ctx context.Context, c config.Config, api Client, apply bool, print func(string, ...any), overwrite ...bool) error {
 	print("scanning source files: %s", c.SourcePath)
+	if err := printStateLocation(c, print); err != nil {
+		return err
+	}
 	var unlock func()
 	if apply {
 		var err error
@@ -1621,7 +1635,7 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 	}
 	if !apply {
 		if c.Sync.DrawioEmbed {
-			print("draw.io SVGs: new embeds export viewer URLs to .notion-sync/; use --replace-drawio-embeds with --push to recreate existing embeds")
+			print("draw.io SVGs: use --replace-drawio-embeds with --push to recreate existing embeds")
 		}
 		return nil
 	}
@@ -1675,6 +1689,9 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 // RunFile limits synchronization to one scanned file; other state entries are retained.
 func RunFile(ctx context.Context, c config.Config, api Client, filename string, apply bool, print func(string, ...any), overwrite ...bool) error {
 	print("scanning source file: %s", filename)
+	if err := printStateLocation(c, print); err != nil {
+		return err
+	}
 	var unlock func()
 	if apply {
 		var err error
@@ -1786,7 +1803,7 @@ func RunFile(ctx context.Context, c config.Config, api Client, filename string, 
 	}
 	if !apply {
 		if c.Sync.DrawioEmbed {
-			print("draw.io SVGs: new embeds export viewer URLs to .notion-sync/; use --replace-drawio-embeds with --push to recreate existing embeds")
+			print("draw.io SVGs: use --replace-drawio-embeds with --push to recreate existing embeds")
 		}
 		return nil
 	}

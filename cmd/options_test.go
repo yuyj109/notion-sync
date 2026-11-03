@@ -124,6 +124,8 @@ func TestParentIDCommands(t *testing.T) {
 		for _, command := range []string{"sync", "sync env", "sync typed", "sync typed env", "diff", "pull", "page sync", "page sync typed", "page sync env", "page sync fallback", "page diff", "doctor", "recover"} {
 			t.Run(kind+"/"+command, func(t *testing.T) {
 				dir := t.TempDir()
+				t.Setenv("HOME", filepath.Join(dir, "home"))
+				t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
 				bin := filepath.Join(dir, "ntn")
 				script := `#!/bin/sh
 case "$*" in

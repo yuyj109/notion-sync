@@ -2,10 +2,12 @@ package sync
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/yuyj109/notion-sync/internal/config"
@@ -22,7 +24,54 @@ type sharedState struct {
 	LegacyScanComplete bool             `json:"legacy_scan_complete,omitempty"`
 }
 
-func sharedStatePath(c config.Config, root string) string {
+func sharedStateDir(source string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		return "", err
+	}
+	resolved, err = filepath.Abs(resolved)
+	if err != nil {
+		return "", err
+	}
+	base, err := stateConfigDir(runtime.GOOS, os.Getenv("HOME"), os.Getenv("XDG_CONFIG_HOME"))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, fmt.Sprintf("%x", sha256.Sum256([]byte(resolved)))), nil
+}
+
+func printStateLocation(c config.Config, print func(string, ...any)) error {
+	dir, err := sharedStateDir(c.SourcePath)
+	if err != nil {
+		return fmt.Errorf("locate shared sync state: %w", err)
+	}
+	print("config directory: %s", filepath.Dir(dir))
+	print("sync data directory: %s", dir)
+	return nil
+}
+
+func stateConfigDir(goos, home, xdg string) (string, error) {
+	if goos != "darwin" && filepath.IsAbs(xdg) {
+		return filepath.Join(xdg, "notion-sync"), nil
+	}
+	if !filepath.IsAbs(home) {
+		return "", fmt.Errorf("HOME must be an absolute path to store shared sync state")
+	}
+	if goos == "darwin" {
+		return filepath.Join(home, ".notion-sync"), nil
+	}
+	return filepath.Join(home, ".config", "notion-sync"), nil
+}
+
+func sharedStatePath(c config.Config, root string) (string, error) {
+	dir, err := sharedStateDir(c.SourcePath)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "state-"+norm(root)+".json"), nil
+}
+
+func legacySharedStatePath(c config.Config, root string) string {
 	return filepath.Join(c.SourcePath, ".notion-sync", "state-"+norm(root)+".json")
 }
 
@@ -35,7 +84,17 @@ func sameDirectory(a, b Entry) bool {
 }
 
 func loadSharedState(c config.Config, s *State) error {
-	data, err := os.ReadFile(sharedStatePath(c, s.RootID))
+	name, err := sharedStatePath(c, s.RootID)
+	if err != nil {
+		return fmt.Errorf("locate shared sync state: %w", err)
+	}
+	data, err := os.ReadFile(name)
+	if os.IsNotExist(err) {
+		data, err = os.ReadFile(legacySharedStatePath(c, s.RootID))
+		if err == nil {
+			s.needsSharedCheckpoint = true
+		}
+	}
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -79,7 +138,10 @@ func saveSharedState(c config.Config, s State) error {
 	if err != nil {
 		return err
 	}
-	name := sharedStatePath(c, s.RootID)
+	name, err := sharedStatePath(c, s.RootID)
+	if err != nil {
+		return fmt.Errorf("locate shared sync state: %w", err)
+	}
 	if err := os.MkdirAll(filepath.Dir(name), 0700); err != nil {
 		return err
 	}

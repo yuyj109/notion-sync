@@ -214,6 +214,9 @@ func PullFile(ctx context.Context, c config.Config, api Client, filename string,
 }
 
 func pull(ctx context.Context, c config.Config, api Client, filename string, apply bool, print func(string, ...any)) error {
+	if err := printStateLocation(c, print); err != nil {
+		return err
+	}
 	if apply {
 		unlock, err := lock()
 		if err != nil {

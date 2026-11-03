@@ -16,6 +16,33 @@ const dirKeyPrefix = "notion-directory."
 
 var flatKeys = map[string]bool{"notion-root-id": true, "notion-parent": true, "notion-target": true, "notion-local-hash": true, "notion-remote-hash": true, "notion-pending-key": true, "notion-pending-parent-id": true, "notion-pending-title": true, "notion-pending-page-id": true, "notion-images": true}
 
+var metadataKeyOrder = map[string]int{
+	"notion-local-hash": 1, "notion-remote-hash": 2, "notion-root-id": 3,
+	"notion-page-id": 4, "notion-parent": 5, "notion-target": 6,
+	"notion-images": 7, "notion-properties": 8,
+}
+
+// Reorder only the specified keys; keep all other fields in their positions.
+func orderMetadataKeys(mapping *yaml.Node) {
+	type pair struct{ key, value *yaml.Node }
+	var pairs []pair
+	for i := 0; i < len(mapping.Content); i += 2 {
+		if _, ok := metadataKeyOrder[mapping.Content[i].Value]; ok {
+			pairs = append(pairs, pair{mapping.Content[i], mapping.Content[i+1]})
+		}
+	}
+	sort.SliceStable(pairs, func(i, j int) bool {
+		return metadataKeyOrder[pairs[i].key.Value] < metadataKeyOrder[pairs[j].key.Value]
+	})
+	next := 0
+	for i := 0; i < len(mapping.Content); i += 2 {
+		if _, ok := metadataKeyOrder[mapping.Content[i].Value]; ok {
+			mapping.Content[i], mapping.Content[i+1] = pairs[next].key, pairs[next].value
+			next++
+		}
+	}
+}
+
 func isFlatKey(key string) bool { return flatKeys[key] || strings.HasPrefix(key, dirKeyPrefix) }
 func readFlat(node *yaml.Node, f *File) error {
 	values := map[string]string{}

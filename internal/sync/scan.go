@@ -31,7 +31,9 @@ type File struct {
 	Images                                         []Image
 	Metadata                                       *Metadata
 	MetadataFormat                                 string
+	PropertiesFormat                               string
 	RootNeedsFormatting                            bool
+	MetadataOrderNeedsFormatting                   bool
 	Properties                                     map[string]any
 }
 
@@ -723,7 +725,7 @@ func yamlFrontmatter(data []byte) (*yaml.Node, string, string, error) {
 }
 
 func isNotionKey(key string) bool {
-	return key == "notion-page-id" || key == "notion-parent-page-id" || key == "notion-database-id" || isFlatKey(key)
+	return key == "notion-properties" || key == "notion-page-id" || key == "notion-parent-page-id" || key == "notion-database-id" || isFlatKey(key)
 }
 
 func frontmatter(data []byte) (*yaml.Node, string, string, error) {
@@ -767,13 +769,18 @@ func frontmatter(data []byte) (*yaml.Node, string, string, error) {
 }
 func parse(data []byte) (File, error) {
 	f := File{Raw: append([]byte(nil), data...)}
-	_, originalBody, _, err := yamlFrontmatter(data)
+	original, originalBody, _, err := yamlFrontmatter(data)
 	if err != nil {
 		return f, err
 	}
 	f.MetadataFormat = "frontmatter"
 	if strings.HasPrefix(originalBody, "<!-- notion-sync\n") || strings.HasPrefix(originalBody, "<!-- notion-sync\r\n") {
 		f.MetadataFormat = "comment"
+	}
+	for i := 0; i < len(original.Content[0].Content); i += 2 {
+		if original.Content[0].Content[i].Value == "notion-properties" {
+			f.PropertiesFormat = "frontmatter"
+		}
 	}
 	root, body, _, err := frontmatter(data)
 	if err != nil {
@@ -782,6 +789,7 @@ func parse(data []byte) (File, error) {
 	f.Body = body
 	f.SyncBody = withoutHTMLComments(body)
 	seen := map[string]bool{}
+	lastMetadataOrder := 0
 	node := root.Content[0]
 	for i := 0; i < len(node.Content); i += 2 {
 		k, v := node.Content[i], node.Content[i+1]
@@ -792,8 +800,17 @@ func parse(data []byte) (File, error) {
 			return f, fmt.Errorf("duplicate frontmatter key %q", k.Value)
 		}
 		seen[k.Value] = true
+		if rank, ok := metadataKeyOrder[k.Value]; ok {
+			if rank < lastMetadataOrder {
+				f.MetadataOrderNeedsFormatting = true
+			}
+			lastMetadataOrder = rank
+		}
 		switch k.Value {
 		case "notion-properties":
+			if f.PropertiesFormat == "" {
+				f.PropertiesFormat = "comment"
+			}
 			if v.Kind != yaml.MappingNode {
 				return f, fmt.Errorf("notion-properties must be a mapping")
 			}

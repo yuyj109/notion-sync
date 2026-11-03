@@ -113,6 +113,8 @@ func (c *embedTestClient) API(_ context.Context, _, _ string, body any, out any)
 
 func TestDrawioExportAndEmptyEmbed(t *testing.T) {
 	dir := t.TempDir()
+	t.Setenv("HOME", filepath.Join(dir, "home"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
 	source := `<svg xmlns="http://www.w3.org/2000/svg" content="&lt;mxfile&gt;&lt;diagram&gt;&lt;mxGraphModel&gt;&lt;root/&gt;&lt;/mxGraphModel&gt;&lt;/diagram&gt;&lt;/mxfile&gt;"><rect/></svg>`
 	name := "diagram.drawio.svg"
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(source), 0600); err != nil {
@@ -122,10 +124,21 @@ func TestDrawioExportAndEmptyEmbed(t *testing.T) {
 	action := Action{File: File{Images: []Image{image}}}
 	var cfg config.Config
 	cfg.SourcePath, cfg.WorkDir, cfg.Sync.DrawioEmbed = dir, dir, true
+	output := filepath.Join(filepath.Dir(testSharedStatePath(t, cfg, rootID)), name+".txt")
+	legacy := filepath.Join(dir, ".notion-sync", name+".txt")
+	write(t, legacy, "old output")
+	if err := exportDrawioURL(cfg, Plan{Actions: []Action{action}}, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Dir(output)); !os.IsNotExist(err) {
+		t.Fatalf("dry-run created output directory: %v", err)
+	}
 	if err := exportDrawioURL(cfg, Plan{Actions: []Action{action}}, true, nil); err != nil {
 		t.Fatal(err)
 	}
-	output := filepath.Join(dir, ".notion-sync", name+".txt")
+	if string(mustRead(t, legacy)) != "old output" {
+		t.Fatal("legacy output was modified")
+	}
 	html, err := os.ReadFile(output)
 	if err != nil || !strings.HasPrefix(string(html), "https://viewer.diagrams.net/") || !strings.Contains(string(html), "%3Cmxfile%3E") {
 		t.Fatalf("unexpected HTML: %s, %v", html, err)
@@ -151,6 +164,55 @@ func TestDrawioExportAndEmptyEmbed(t *testing.T) {
 	got, _ := os.ReadFile(output)
 	if string(got) != "user content" {
 		t.Fatal("overwrote user content")
+	}
+}
+
+func TestRestoreMissingManagedDrawioURL(t *testing.T) {
+	c, _, dir := setup(t)
+	name := "diagram.drawio.svg"
+	source := `<svg xmlns="http://www.w3.org/2000/svg" content="&lt;mxfile&gt;&lt;diagram&gt;&lt;mxGraphModel&gt;&lt;root/&gt;&lt;/mxGraphModel&gt;&lt;/diagram&gt;&lt;/mxfile&gt;"/>`
+	write(t, filepath.Join(dir, name), source)
+	image := Image{Name: name, Path: name, Hash: hash(source), Key: "image-1"}
+	blockID := "11111111-1111-1111-1111-111111111111"
+	entry := Entry{ImageBlocks: map[string]string{"image-1": blockID}, ImageHashes: map[string]string{"image-1": hash("drawio-embed:" + image.Hash)}, managedEmbeds: map[string]bool{norm(blockID): true}}
+	plan := Plan{Actions: []Action{{Kind: "unchanged", File: File{Images: []Image{image}}, Entry: entry}}}
+	output := filepath.Join(filepath.Dir(testSharedStatePath(t, c, rootID)), name+".txt")
+	var preview strings.Builder
+	if err := exportDrawioURL(c, plan, false, func(format string, args ...any) { fmt.Fprintf(&preview, format+"\n", args...) }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(output); !os.IsNotExist(err) || !strings.Contains(preview.String(), output) {
+		t.Fatalf("dry-run did not preview output without writing: %s %v", preview.String(), err)
+	}
+	var result strings.Builder
+	if err := exportDrawioURL(c, plan, true, func(format string, args ...any) { fmt.Fprintf(&result, format+"\n", args...) }); err != nil {
+		t.Fatal(err)
+	}
+	url := strings.TrimSpace(string(mustRead(t, output)))
+	if !strings.HasPrefix(url, "https://viewer.diagrams.net/") || !strings.Contains(result.String(), url) {
+		t.Fatal("missing restored URL")
+	}
+	write(t, output, "do not replace")
+	if err := exportDrawioURL(c, plan, true, nil); err != nil || string(mustRead(t, output)) != "do not replace" {
+		t.Fatalf("existing URL was not preserved: %v", err)
+	}
+	if err := os.Remove(output); err != nil {
+		t.Fatal(err)
+	}
+	entry.ImageHashes["image-1"] = hash("drawio-embed:previous-diagram")
+	if err := exportDrawioURL(c, plan, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(output); !os.IsNotExist(err) {
+		t.Fatalf("changed diagram should not be exported for an existing embed: %v", err)
+	}
+	invalid := `<svg xmlns="http://www.w3.org/2000/svg"/>`
+	write(t, filepath.Join(dir, name), invalid)
+	plan.Actions[0].File.Images[0].Hash = hash(invalid)
+	entry.ImageHashes["image-1"] = hash("drawio-embed:" + hash(invalid))
+	var warning strings.Builder
+	if err := exportDrawioURL(c, plan, true, func(format string, args ...any) { fmt.Fprintf(&warning, format+"\n", args...) }); err != nil || !strings.Contains(warning.String(), "cannot restore") {
+		t.Fatalf("invalid existing diagram should warn without blocking: %v, %s", err, warning.String())
 	}
 }
 
@@ -203,6 +265,8 @@ func TestDrawioViewerUsesCompressedModel(t *testing.T) {
 
 func TestDrawioExportKeepsLongURL(t *testing.T) {
 	dir := t.TempDir()
+	t.Setenv("HOME", filepath.Join(dir, "home"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
 	source := `<svg xmlns="http://www.w3.org/2000/svg" content="&lt;mxfile&gt;&lt;diagram&gt;` + strings.Repeat("a", 2200) + `&lt;/diagram&gt;&lt;/mxfile&gt;"/>`
 	name := "large.drawio.svg"
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(source), 0600); err != nil {
@@ -212,11 +276,11 @@ func TestDrawioExportKeepsLongURL(t *testing.T) {
 	var cfg config.Config
 	cfg.SourcePath, cfg.WorkDir = dir, dir
 	var warning string
-	err := exportDrawioURL(cfg, Plan{Actions: []Action{{File: File{Images: []Image{image}}}}}, true, func(format string, args ...any) { warning = fmt.Sprintf(format, args...) })
+	err := exportDrawioURL(cfg, Plan{Actions: []Action{{File: File{Images: []Image{image}}}}}, true, func(format string, args ...any) { warning += fmt.Sprintf(format, args...) + "\n" })
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(filepath.Join(dir, ".notion-sync", name+".txt"))
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(testSharedStatePath(t, cfg, rootID)), name+".txt"))
 	if err != nil || len(data) <= 2000 {
 		t.Fatalf("long URL not exported: length=%d err=%v", len(data), err)
 	}
@@ -749,7 +813,7 @@ func TestSkippedPageDoesNotExportURLOrBlockOtherUpdates(t *testing.T) {
 	}
 	write(t, home, string(mustRead(t, home))+"\n![new](new.drawio.svg)\n")
 	write(t, other, strings.Replace(string(mustRead(t, other)), "# Old\n", "# New\n", 1))
-	output := filepath.Join(cfg.WorkDir, ".notion-sync", "new.drawio.svg.txt")
+	output := filepath.Join(filepath.Dir(testSharedStatePath(t, cfg, rootID)), "new.drawio.svg.txt")
 	write(t, output, "do not overwrite")
 	client := &embedAndPagesClient{fakeAPI: base, embedID: embedID}
 	for _, apply := range []bool{false, true} {
@@ -969,7 +1033,7 @@ func TestPreviewAndApplyLinkDependentEmbedReplacement(t *testing.T) {
 	if base.creates != 0 || base.updates != 0 {
 		t.Fatal("dry-run modified Notion")
 	}
-	output := filepath.Join(cfg.WorkDir, ".notion-sync", "diagram.drawio.svg.txt")
+	output := filepath.Join(filepath.Dir(testSharedStatePath(t, cfg, rootID)), "diagram.drawio.svg.txt")
 	write(t, output, "user content")
 	for _, apply := range []bool{false, true} {
 		if err := Run(context.Background(), cfg, client, apply, func(string, ...any) {}, true); err == nil || !strings.Contains(err.Error(), "already exists with different content") {

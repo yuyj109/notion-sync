@@ -109,29 +109,35 @@ func rejectSharedPendingReset(paths []string) error {
 		}
 	}
 	for root := range roots {
-		entries, err := os.ReadDir(filepath.Join(root, ".notion-sync"))
-		if os.IsNotExist(err) {
-			continue
-		}
+		dir, err := sharedStateDir(root)
 		if err != nil {
-			return fmt.Errorf("inspect shared sync state: %w", err)
+			return fmt.Errorf("locate shared sync state: %w", err)
 		}
-		for _, entry := range entries {
-			id, ok := strings.CutPrefix(entry.Name(), "state-")
-			if !ok || !strings.HasSuffix(id, ".json") {
+		for _, stateDir := range []string{dir, filepath.Join(root, ".notion-sync")} {
+			entries, err := os.ReadDir(stateDir)
+			if os.IsNotExist(err) {
 				continue
 			}
-			id = strings.TrimSuffix(id, ".json")
-			if !config.ValidID(id) || id != norm(id) || !entry.Type().IsRegular() {
-				return fmt.Errorf("invalid shared sync state file %s", entry.Name())
+			if err != nil {
+				return fmt.Errorf("inspect shared sync state: %w", err)
 			}
-			c := config.Config{SourcePath: root}
-			s := State{RootID: id, Entries: map[string]Entry{}}
-			if err := loadSharedState(c, &s); err != nil {
-				return err
-			}
-			if s.Pending != nil && selected[filepath.Join(root, filepath.FromSlash(s.PendingOwner))] {
-				return fmt.Errorf("%s: pending creation must be resolved with recover before clearing metadata", s.PendingOwner)
+			for _, entry := range entries {
+				id, ok := strings.CutPrefix(entry.Name(), "state-")
+				if !ok || !strings.HasSuffix(id, ".json") {
+					continue
+				}
+				id = strings.TrimSuffix(id, ".json")
+				if !config.ValidID(id) || id != norm(id) || !entry.Type().IsRegular() {
+					return fmt.Errorf("invalid shared sync state file %s", entry.Name())
+				}
+				c := config.Config{SourcePath: root}
+				s := State{RootID: id, Entries: map[string]Entry{}}
+				if err := loadSharedState(c, &s); err != nil {
+					return err
+				}
+				if s.Pending != nil && selected[filepath.Join(root, filepath.FromSlash(s.PendingOwner))] {
+					return fmt.Errorf("%s: pending creation must be resolved with recover before clearing metadata", s.PendingOwner)
+				}
 			}
 		}
 	}
@@ -181,6 +187,16 @@ func prepareReset(name string) (resetFile, error) {
 		return f, nil
 	}
 	mapping.Content = content
+	if parsed.PropertiesFormat == "comment" {
+		f.after, err = renderMetadata(root, body, nl, "comment", f.before)
+		if err != nil {
+			return f, err
+		}
+		if _, err := parse(f.after); err != nil {
+			return f, fmt.Errorf("remaining comment would be invalid: %w", err)
+		}
+		return f, nil
+	}
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)

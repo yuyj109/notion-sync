@@ -204,6 +204,8 @@ func (f *fakeUploader) Upload(_ context.Context, _, _, _ string) (string, error)
 func setup(t *testing.T) (config.Config, *fakeAPI, string) {
 	t.Helper()
 	dir := t.TempDir()
+	t.Setenv("HOME", filepath.Join(dir, "home"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
 	source := filepath.Join(dir, "docs")
 	if err := os.Mkdir(source, 0700); err != nil {
 		t.Fatal(err)
@@ -213,6 +215,7 @@ func setup(t *testing.T) (config.Config, *fakeAPI, string) {
 	c.SourcePath = source
 	c.Notion.ParentPageID = rootID
 	c.Sync.PreserveHierarchy = true
+	c.Sync.MetadataFormat = "frontmatter"
 	c.Sync.Include = []string{"**/*.md"}
 	c.Sync.Exclude = []string{"**/node_modules/**"}
 	api := &fakeAPI{pages: map[string]*fakePage{norm(rootID): {parent: rootID}}}

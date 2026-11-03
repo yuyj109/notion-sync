@@ -102,6 +102,20 @@ func TestResolveParentID(t *testing.T) {
 	}
 }
 
+func TestPropertyFlagsPreserveSpacesAndEquals(t *testing.T) {
+	t.Setenv("NOTION_SYNC_PARENT_ID", "11111111111111111111111111111111")
+	root := &cobra.Command{Use: "test"}
+	var opts runtimeOptions
+	opts.addFlags(root)
+	if err := root.PersistentFlags().Parse([]string{"--property", "Status=Done", "--property", "Description=Hello World = yes"}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := opts.resolve(root, "", "", "")
+	if err != nil || c.Sync.Properties["Status"] != "Done" || c.Sync.Properties["Description"] != "Hello World = yes" {
+		t.Fatalf("properties=%v error=%v", c.Sync.Properties, err)
+	}
+}
+
 func TestParentIDCommands(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
 	const parentID = "11111111-1111-1111-1111-111111111111"

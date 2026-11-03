@@ -191,12 +191,13 @@ func drawioMediaParts(ctx context.Context, api Client, a Action, remote string) 
 			return nil, nil, false, nil
 		}
 		value := remote[m.start:m.end]
-		if isDrawioSVG(image) {
+		switch {
+		case isDrawioSVG(image):
 			if m.kind != "embed" || !a.Entry.managedEmbeds[id] {
 				return nil, nil, false, nil
 			}
 			media = append(media, value)
-		} else if image.ContentType == "video/mp4" {
+		case image.ContentType == "video/mp4":
 			if m.kind != "video" {
 				return nil, nil, false, nil
 			}
@@ -206,7 +207,7 @@ func drawioMediaParts(ctx context.Context, api Client, a Action, remote string) 
 				return nil, nil, false, nil
 			}
 			media = append(media, "video:"+id+":"+block.LastEditedTime+":"+imageFileKey(mediaBlockURL(block)))
-		} else {
+		default:
 			if m.kind != "image" {
 				return nil, nil, false, nil
 			}

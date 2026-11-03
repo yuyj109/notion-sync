@@ -165,12 +165,12 @@ func (r Runner) Upload(ctx context.Context, filename, contentType, localPath str
 		if err != nil {
 			return "", err
 		}
-		defer source.Close()
+		defer func() { _ = source.Close() }()
 		dir, err := os.MkdirTemp("", "notion-sync-upload-*")
 		if err != nil {
 			return "", err
 		}
-		defer os.RemoveAll(dir)
+		defer func() { _ = os.RemoveAll(dir) }()
 		for part := int64(1); part <= parts; part++ {
 			partFile, err := os.CreateTemp(dir, "part-*"+filepath.Ext(filename))
 			if err != nil {

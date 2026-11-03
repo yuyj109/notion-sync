@@ -32,6 +32,7 @@ type File struct {
 	Metadata                                       *Metadata
 	MetadataFormat                                 string
 	RootNeedsFormatting                            bool
+	Properties                                     map[string]any
 }
 
 // Image is a local Markdown image reference that can be uploaded to Notion.
@@ -597,7 +598,7 @@ func hashFile(filename string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
@@ -792,6 +793,27 @@ func parse(data []byte) (File, error) {
 		}
 		seen[k.Value] = true
 		switch k.Value {
+		case "notion-properties":
+			if v.Kind != yaml.MappingNode {
+				return f, fmt.Errorf("notion-properties must be a mapping")
+			}
+			f.Properties = map[string]any{}
+			for j := 0; j < len(v.Content); j += 2 {
+				key, value := v.Content[j], v.Content[j+1]
+				if key.Kind != yaml.ScalarNode || key.Tag != "!!str" || strings.TrimSpace(key.Value) == "" {
+					return f, fmt.Errorf("notion-properties names must be nonempty strings")
+				}
+				if _, exists := f.Properties[key.Value]; exists {
+					return f, fmt.Errorf("duplicate notion property %q", key.Value)
+				}
+				var parsed any
+				if value.Kind == yaml.ScalarNode && value.Tag == "!!timestamp" {
+					parsed = value.Value
+				} else if err := value.Decode(&parsed); err != nil {
+					return f, fmt.Errorf("property %q: %w", key.Value, err)
+				}
+				f.Properties[key.Value] = parsed
+			}
 		case "notion-page-id", "notion-parent-page-id", "notion-database-id":
 			if v.Kind != yaml.ScalarNode || v.Tag != "!!str" || !config.ValidID(v.Value) {
 				return f, fmt.Errorf("invalid Notion ID for %s", k.Value)

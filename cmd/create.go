@@ -52,10 +52,26 @@ func addDBCreate(parent *cobra.Command) {
 	parent.AddCommand(c)
 }
 func createPage(cmd *cobra.Command, id, kind, property, title, content string, asJSON bool) error {
+	if cmd.Root().PersistentFlags().Changed("property") {
+		return fmt.Errorf("--property is supported by sync and diff commands, not create")
+	}
 	if strings.TrimSpace(title) == "" {
 		return fmt.Errorf("title must not be empty")
 	}
 	body := map[string]any{"parent": map[string]any{kind: id}, "properties": map[string]any{property: titleProperty(title)}}
+	icon, err := cmd.Root().PersistentFlags().GetString("icon")
+	if err != nil {
+		return err
+	}
+	if icon = strings.TrimSpace(icon); icon != "" {
+		if strings.EqualFold(icon, "random") {
+			icon, err = notion.RandomIcon()
+			if err != nil {
+				return err
+			}
+		}
+		body["icon"] = notion.NativeIcon(icon)
+	}
 	if content != "" {
 		body["markdown"] = content
 	}
@@ -67,9 +83,13 @@ func createPage(cmd *cobra.Command, id, kind, property, title, content string, a
 	if !ok || !config.ValidID(newID) || result["object"] != "page" {
 		return fmt.Errorf("unexpected create response; inspect destination before retrying")
 	}
+	if err := notion.LockPage(cmd.Context(), notion.Runner{}, newID); err != nil {
+		return fmt.Errorf("page %s was created but lock could not be verified; inspect Notion before retrying: %w", newID, err)
+	}
+	result["is_locked"] = true
 	if asJSON {
 		return printJSON(cmd, result)
 	}
-	_, err := fmt.Fprintln(cmd.OutOrStdout(), newID)
+	_, err = fmt.Fprintln(cmd.OutOrStdout(), newID)
 	return err
 }

@@ -78,6 +78,30 @@ notion-sync db query <database> --json
 notion-sync db create <database> --title "Title" --content "Markdown"
 ```
 
+DB 同期では、Markdown の frontmatter からプロパティを設定できます。
+
+```yaml
+---
+notion-properties:
+  Status: Done
+  Description: Hello World
+  Tags: [Go, Notion]
+---
+```
+
+全対象ファイルに同じ値を設定する場合は、`--property` を繰り返します。指定値は各ファイルの `notion-properties` にも保存され、同名の既存値を上書きします。スペースを含む値はシェルの引用符で囲んでください。
+
+```sh
+notion-sync sync ./docs --parent-id <database-id> \
+  --property Status=Done --property 'Description=Hello World' --dry-run
+notion-sync sync ./docs --parent-id <database-id> \
+  --property Status=Done --property 'Description=Hello World'
+```
+
+`page sync`、`diff`、`page diff` でも指定できます。DB にない名前や未対応の型はエラーになり、指定のないプロパティは保持します。対応型はテキスト、数値、チェックボックス、日付（開始日のみ）、セレクト、ステータス、マルチセレクト、URL、メール、電話番号です。セレクト系は DB に存在する選択肢を指定してください。マルチセレクトは frontmatter の配列、または `--property 'Tags=Go,Notion'` のようにカンマ区切りで指定し、値全体を置き換えます。読み取り専用型、リレーション、ユーザー、ファイル、日付範囲には対応していません。タイトルは従来どおり本文から決まります。
+
+`--dry-run` で変更予定を確認できます。実行時はローカルの frontmatter を先に更新してから Notion に反映するため、途中で失敗した場合は両方を確認してください。frontmatter の YAML の書式は変更されることがあります。計画後に対象プロパティが Notion 側で変更された場合は上書きせず停止します。
+
 ### 同期・復旧
 
 ```sh
@@ -141,6 +165,14 @@ draw.io の埋め込み方式を常に使うには、環境変数または `.env
 ## 仕組み
 
 `ntn` 経由で Notion API を呼び出します。`diff` と `--dry-run` は Notion とローカルファイルを変更せず、`sync` は Markdown の frontmatter または HTML コメントに同期情報を書き戻します。DB 同期では、サブディレクトリのファイルも同じ DB に作成されます。
+
+同期や差分確認の開始後は、同期先の確認、ファイルごとの Notion ページやロックの確認、画像・埋め込みの検証などを進捗として表示します。処理件数が多い場合や Notion の応答に時間がかかる場合は、各表示の後に待ち時間が発生します。
+
+新規作成するページは編集ロックをオンにします。同期で作成するディレクトリ用ページと `page create`・`db create` にも適用されます。同期対象の既存ページも、本文に変更がなくてもロックをオンにします。`--dry-run` はロック対象を表示します。作成後にロック設定を確認できなかった場合は、Notion で該当ページを確認し、必要なら手動でロックしてください。同期の場合は作成保留を `recover` で復旧します。
+
+アイコンは指定した場合に設定します。例えば `notion-sync sync ./docs --parent-id <ID> --icon document` は、同期対象の新規・既存ページとディレクトリ用ページに Notion の組み込み `document` アイコンを既定色で設定します。`page sync` や `page create`、`db create` でも `--icon <名前>` を使えます。省略時は新規ページにアイコンを指定せず、既存ページのアイコンを保持します。既存アイコンは上書きされるため、`--dry-run` で対象を確認してください。指定できる名前は Notion の組み込みアイコン名で、絵文字・画像はこのオプションでは指定できません。
+
+`--icon random` は、確認済みの Notion 組み込みアイコンの候補からページごとに選びます。同期では親 ID とファイル・ディレクトリのパスをもとに選ぶため、同じ対象を再同期してもアイコンは変わりません。既存ページのアイコンも選択結果で上書きします。`--dry-run` は実際に設定されるアイコン名を表示します。`page create`・`db create` では作成のたびにランダムに選びます。
 
 Notion 側に変更がある場合は同期を停止します。ローカルの内容で上書きする場合は、まず `notion-sync sync ./docs --push --dry-run` で対象を確認し、`--dry-run` を外して実行します。`--push` は指定した同期範囲の競合するページすべてに適用されます。単一ファイルは `notion-sync page sync <file> --push` を使えます。従来の `--overwrite` も `--push` の別名として利用できます。
 

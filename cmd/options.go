@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/yuyj109/notion-sync/internal/config"
@@ -12,10 +13,11 @@ import (
 )
 
 type runtimeOptions struct {
-	envFile, source, parentID, parentType, metadataFormat string
-	preserve                                              bool
-	drawioEmbed                                           bool
-	include, exclude                                      []string
+	envFile, source, parentID, parentType, metadataFormat, icon string
+	preserve                                                    bool
+	drawioEmbed                                                 bool
+	include, exclude                                            []string
+	properties                                                  []string
 }
 
 func (o *runtimeOptions) addFlags(root *cobra.Command) {
@@ -27,6 +29,8 @@ func (o *runtimeOptions) addFlags(root *cobra.Command) {
 	f.BoolVar(&o.preserve, "preserve-hierarchy", true, "reproduce directory hierarchy for page parents (databases are flat)")
 	f.BoolVar(&o.drawioEmbed, "drawio-embed", false, "export draw.io viewer URLs and create empty embeds")
 	f.StringVar(&o.metadataFormat, "metadata-format", "frontmatter", "metadata format: frontmatter or comment")
+	f.StringVar(&o.icon, "icon", "", "set native Notion icon by name, or random, on synchronized or created pages")
+	f.StringArrayVar(&o.properties, "property", nil, "set database property as NAME=VALUE (repeatable)")
 	f.StringSliceVar(&o.include, "include", nil, "include patterns (repeatable or comma-separated)")
 	f.StringSliceVar(&o.exclude, "exclude", nil, "exclude patterns (repeatable or comma-separated)")
 }
@@ -57,13 +61,34 @@ func (o *runtimeOptions) resolve(cmd *cobra.Command, positionalSource, fallbackP
 	if flags.Changed("metadata-format") {
 		opts.MetadataFormat = &o.metadataFormat
 	}
+	if flags.Changed("icon") {
+		opts.Icon = &o.icon
+	}
 	if flags.Changed("include") {
 		opts.Include = &o.include
 	}
 	if flags.Changed("exclude") {
 		opts.Exclude = &o.exclude
 	}
-	return config.Resolve(opts)
+	c, err := config.Resolve(opts)
+	if err != nil {
+		return c, err
+	}
+	if flags.Changed("property") {
+		c.Sync.Properties = make(map[string]string, len(o.properties))
+		for _, item := range o.properties {
+			name, value, ok := strings.Cut(item, "=")
+			name = strings.TrimSpace(name)
+			if !ok || name == "" {
+				return c, fmt.Errorf("--property must be NAME=VALUE")
+			}
+			if _, exists := c.Sync.Properties[name]; exists {
+				return c, fmt.Errorf("duplicate --property %q", name)
+			}
+			c.Sync.Properties[name] = value
+		}
+	}
+	return c, nil
 }
 
 func resolveParentID(ctx context.Context, cfg *config.Config, api syncer.Client) error {

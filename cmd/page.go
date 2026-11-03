@@ -36,6 +36,12 @@ func addPageCommands(root *cobra.Command, opts *runtimeOptions) {
 			if pull && (push || overwrite || replaceDrawio) {
 				return fmt.Errorf("--pull cannot be combined with --push or --replace-drawio-embeds")
 			}
+			if pull && cmd.Root().PersistentFlags().Changed("icon") {
+				return fmt.Errorf("--icon cannot be combined with --pull")
+			}
+			if pull && cmd.Root().PersistentFlags().Changed("property") {
+				return fmt.Errorf("--property cannot be combined with --pull")
+			}
 			fallback, err := syncer.FileRootID(args[0])
 			if err != nil {
 				return err
@@ -51,6 +57,7 @@ func addPageCommands(root *cobra.Command, opts *runtimeOptions) {
 				return fmt.Errorf("--replace-drawio-embeds requires --drawio-embed")
 			}
 			cfg.Sync.ReplaceDrawioEmbeds = replaceDrawio
+			printSync(cmd.OutOrStdout(), "checking parent destination")
 			if err := resolveParentID(cmd.Context(), &cfg, notion.Runner{}); err != nil {
 				return err
 			}

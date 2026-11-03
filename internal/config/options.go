@@ -35,6 +35,7 @@ type Options struct {
 	PreserveHierarchy *bool
 	DrawioEmbed       *bool
 	MetadataFormat    *string
+	Icon              *string
 	Include           *[]string
 	Exclude           *[]string
 	FallbackParentID  string
@@ -129,6 +130,9 @@ func Resolve(o Options) (Config, error) {
 	}
 	if o.MetadataFormat != nil {
 		c.Sync.MetadataFormat = *o.MetadataFormat
+	}
+	if o.Icon != nil {
+		c.Sync.Icon = strings.TrimSpace(*o.Icon)
 	}
 	if c.Sync.MetadataFormat != "frontmatter" && c.Sync.MetadataFormat != "comment" {
 		return c, fmt.Errorf("metadata format must be frontmatter or comment")

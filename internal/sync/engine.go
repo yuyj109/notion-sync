@@ -3,8 +3,10 @@ package sync
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/yuyj109/notion-sync/internal/config"
+	"github.com/yuyj109/notion-sync/internal/notion"
 )
 
 type Client interface {
@@ -22,10 +25,13 @@ type MultipartClient interface {
 	Upload(context.Context, string, string, string) (string, error)
 }
 type page struct {
-	Object  string `json:"object"`
-	ID      string `json:"id"`
-	InTrash bool   `json:"in_trash"`
-	Parent  struct {
+	Object     string                     `json:"object"`
+	ID         string                     `json:"id"`
+	InTrash    bool                       `json:"in_trash"`
+	Locked     *bool                      `json:"is_locked"`
+	Icon       json.RawMessage            `json:"icon"`
+	Properties map[string]json.RawMessage `json:"properties"`
+	Parent     struct {
 		Type         string `json:"type"`
 		PageID       string `json:"page_id"`
 		DataSourceID string `json:"data_source_id"`
@@ -86,6 +92,12 @@ type Action struct {
 	Body                                                                              string
 	TextParts                                                                         []string
 	Overwrite, ForceReplace, LinkDependent                                            bool
+	Lock                                                                              bool
+	lockStatus                                                                        *bool
+	iconStatus                                                                        json.RawMessage
+	IconName                                                                          string
+	creationIcon                                                                      string
+	propertyPlan                                                                      *propertyPlan
 	ConflictDiff                                                                      string
 	ConflictDiffNumbered                                                              string
 }
@@ -182,42 +194,67 @@ func (e *remoteChangedError) Error() string {
 }
 
 func validateExisting(ctx context.Context, api Client, e Entry) (markdown, error) {
+	m, _, err := validateExistingPage(ctx, api, e)
+	return m, err
+}
+
+func validateExistingPage(ctx context.Context, api Client, e Entry) (markdown, page, error) {
 	p, err := getPage(ctx, api, e.PageID)
 	if err != nil {
-		return markdown{}, err
+		return markdown{}, p, err
 	}
 	id, kind := parentOf(p)
 	if kind != e.ParentType || norm(id) != norm(e.ParentID) {
-		return markdown{}, fmt.Errorf("page %s was moved; resolve manually", e.PageID)
+		return markdown{}, p, fmt.Errorf("page %s was moved; resolve manually", e.PageID)
 	}
 	if e.RemoteHash == "" {
-		return markdown{}, nil
+		return markdown{}, p, nil
 	}
 	m, err := getMarkdown(ctx, api, e.PageID)
 	if err != nil {
-		return m, err
+		return m, p, err
 	}
 	if remoteMarkdownHash(m.Markdown) != e.RemoteHash {
 		if len(e.managedEmbeds) == 0 {
-			return m, &remoteChangedError{pageID: e.PageID}
+			return m, p, &remoteChangedError{pageID: e.PageID}
 		}
 		normalized, _, err := normalizeManagedEmbeds(ctx, api, e, m.Markdown)
 		if err != nil {
-			return m, err
+			return m, p, err
 		}
 		// Notion may append a trailing empty placeholder when an embed is edited.
 		// Accept it only if removing it restores the exact stored baseline.
 		withoutEmpty := strings.TrimSuffix(normalized, "\n<empty-block/>")
 		if remoteMarkdownHash(normalized) != e.RemoteHash && remoteMarkdownHash(withoutEmpty) != e.RemoteHash {
-			return m, &remoteChangedError{pageID: e.PageID}
+			return m, p, &remoteChangedError{pageID: e.PageID}
 		}
 	}
-	return m, nil
+	return m, p, nil
 }
 func Build(ctx context.Context, c config.Config, api Client, files []File, s State, overwrite ...bool) (Plan, error) {
+	return build(ctx, c, api, files, s, nil, overwrite...)
+}
+
+func build(ctx context.Context, c config.Config, api Client, files []File, s State, progress func(string, ...any), overwrite ...bool) (Plan, error) {
 	plan := Plan{}
+	type dataSourceInfo struct{ id, title string }
+	dataSources := map[string]dataSourceInfo{}
+	resolveDataSource := func(id string) (string, string, error) {
+		key := norm(id)
+		if info, ok := dataSources[key]; ok {
+			return info.id, info.title, nil
+		}
+		ds, title, err := ResolveDataSource(ctx, api, id)
+		if err == nil {
+			dataSources[key] = dataSourceInfo{ds, title}
+		}
+		return ds, title, err
+	}
+	if progress != nil {
+		progress("checking destination in Notion")
+	}
 	if c.Notion.ParentDatabaseID != "" {
-		if _, _, err := ResolveDataSource(ctx, api, c.Notion.ParentDatabaseID); err != nil {
+		if _, _, err := resolveDataSource(c.Notion.ParentDatabaseID); err != nil {
 			return plan, fmt.Errorf("configured database: %w", err)
 		}
 		for i := range files {
@@ -264,6 +301,9 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 		return di < dj
 	})
 	for _, d := range dirs {
+		if progress != nil {
+			progress("checking directory %s", d)
+		}
 		key := "dir:" + d
 		parentDir := path.Dir(d)
 		parentID := c.Notion.ParentPageID
@@ -278,9 +318,12 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 			if e.Target != target || parentID == "" || norm(e.ParentID) != norm(parentID) {
 				return plan, fmt.Errorf("directory destination changed for %s", d)
 			}
-			if _, err := validateExisting(ctx, api, e); err != nil {
+			_, remotePage, err := validateExistingPage(ctx, api, e)
+			if err != nil {
 				return plan, fmt.Errorf("%s: %w", d, err)
 			}
+			a.lockStatus = remotePage.Locked
+			a.iconStatus = remotePage.Icon
 			a.Kind = "directory-existing"
 		default:
 			for _, f := range files {
@@ -295,7 +338,10 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 		plan.Actions = append(plan.Actions, a)
 	}
 	live := map[string]bool{}
-	for _, f := range files {
+	for i, f := range files {
+		if progress != nil {
+			progress("checking page %d/%d: %s", i+1, len(files), f.Path)
+		}
 		for i := range f.Images {
 			if c.Sync.DrawioEmbed && isDrawioSVG(f.Images[i]) {
 				f.Images[i].StateHash = hash("drawio-embed:" + f.Images[i].Hash)
@@ -329,7 +375,7 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 				a.ParentID, a.ParentType = f.ParentID, "page_id"
 			}
 			if f.DatabaseID != "" {
-				ds, title, err := ResolveDataSource(ctx, api, f.DatabaseID)
+				ds, title, err := resolveDataSource(f.DatabaseID)
 				if err != nil {
 					return plan, err
 				}
@@ -341,7 +387,7 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 			a.ParentType = "page_id"
 		case f.DatabaseID != "":
 			a.Target = "database:" + norm(f.DatabaseID)
-			ds, t, err := ResolveDataSource(ctx, api, f.DatabaseID)
+			ds, t, err := resolveDataSource(f.DatabaseID)
 			if err != nil {
 				return plan, fmt.Errorf("%s: %w", f.Path, err)
 			}
@@ -354,7 +400,7 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 			a.ParentType = "page_id"
 		case f.PageID != "" && exists && strings.HasPrefix(e.Target, "database:"):
 			a.Target = e.Target
-			ds, title, err := ResolveDataSource(ctx, api, strings.TrimPrefix(e.Target, "database:"))
+			ds, title, err := resolveDataSource(strings.TrimPrefix(e.Target, "database:"))
 			if err != nil {
 				return plan, fmt.Errorf("%s: %w", f.Path, err)
 			}
@@ -392,7 +438,9 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 			if e.Target != a.Target || a.ParentID != "" && norm(e.ParentID) != norm(a.ParentID) || f.PageID != "" && norm(e.PageID) != norm(f.PageID) {
 				return plan, fmt.Errorf("%s: destination changed; resolve manually", f.Path)
 			}
-			m, err := validateExisting(ctx, api, e)
+			m, remotePage, err := validateExistingPage(ctx, api, e)
+			a.lockStatus = remotePage.Locked
+			a.iconStatus = remotePage.Icon
 			conflict := false
 			if err != nil {
 				var changed *remoteChangedError
@@ -450,6 +498,8 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 			if err != nil {
 				return plan, fmt.Errorf("%s: %w", f.Path, err)
 			}
+			a.lockStatus = p.Locked
+			a.iconStatus = p.Icon
 			pid, ptype := parentOf(p)
 			if !config.ValidID(pid) {
 				return plan, fmt.Errorf("%s: unsupported page parent", f.Path)
@@ -458,7 +508,7 @@ func Build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 				return plan, fmt.Errorf("%s: page is not under the specified parent", f.Path)
 			}
 			if f.DatabaseID != "" {
-				ds, _, err := ResolveDataSource(ctx, api, f.DatabaseID)
+				ds, _, err := resolveDataSource(f.DatabaseID)
 				if err != nil {
 					return plan, err
 				}
@@ -713,6 +763,20 @@ func mediaLabel(images []Image) string {
 
 func printPlan(p Plan, print func(string, ...any)) {
 	for _, a := range p.Actions {
+		if a.propertyPlan != nil {
+			for _, line := range a.propertyPlan.preview {
+				print("%s: %s", a.Path, line)
+			}
+		}
+		if a.creationIcon != "" && (a.Kind == "create" || a.Kind == "directory-create") {
+			print("set icon %s on new page: %s", a.creationIcon, a.Path)
+		}
+		if a.Lock {
+			print("lock %s -> %s", a.Path, pageURL(a.Entry.PageID))
+		}
+		if a.IconName != "" {
+			print("set icon %s on %s -> %s", a.IconName, a.Path, pageURL(a.Entry.PageID))
+		}
 		if a.Kind != "directory-existing" {
 			destination := a.Target
 			if a.Entry.PageID != "" {
@@ -764,6 +828,64 @@ func printPlan(p Plan, print func(string, ...any)) {
 	for _, d := range p.Deleted {
 		print("local file missing (no deletion): %s", d)
 	}
+}
+
+func requestedIcon(c config.Config, a Action) string {
+	if !strings.EqualFold(c.Sync.Icon, "random") {
+		return c.Sync.Icon
+	}
+	root := c.Notion.ParentPageID
+	if c.Notion.ParentDatabaseID != "" {
+		root = c.Notion.ParentDatabaseID
+	}
+	return notion.StableRandomIcon(norm(root) + ":" + a.Key)
+}
+
+func planPageLocks(ctx context.Context, c config.Config, api Client, p *Plan, skipped map[string]bool, progress func(string, ...any)) error {
+	for i := range p.Actions {
+		a := &p.Actions[i]
+		if skipped[a.Key] {
+			continue
+		}
+		icon := requestedIcon(c, *a)
+		if a.Kind == "create" || a.Kind == "directory-create" {
+			a.creationIcon = icon
+		}
+		if a.Entry.PageID == "" {
+			continue
+		}
+		if a.lockStatus == nil || icon != "" && len(a.iconStatus) == 0 {
+			if progress != nil {
+				progress("checking page settings: %s", a.Path)
+			}
+			page, err := getPage(ctx, api, a.Entry.PageID)
+			if err != nil {
+				return fmt.Errorf("%s: cannot check page settings: %w", a.Path, err)
+			}
+			id, kind := parentOf(page)
+			if kind != a.Entry.ParentType || norm(id) != norm(a.Entry.ParentID) {
+				return fmt.Errorf("%s: page was moved; resolve manually", a.Path)
+			}
+			a.lockStatus, a.iconStatus = page.Locked, page.Icon
+		}
+		if a.lockStatus == nil {
+			return fmt.Errorf("%s: page response omitted lock status", a.Path)
+		}
+		a.Lock = !*a.lockStatus
+		if icon != "" {
+			if len(a.iconStatus) == 0 {
+				return fmt.Errorf("%s: page response omitted icon", a.Path)
+			}
+			var current *notion.Icon
+			if err := json.Unmarshal(a.iconStatus, &current); err != nil {
+				return fmt.Errorf("%s: invalid page icon: %w", a.Path, err)
+			}
+			if !current.Matches(icon) {
+				a.IconName = icon
+			}
+		}
+	}
+	return nil
 }
 
 // Preview changes caused by links to pages that will be created in this run.
@@ -857,11 +979,14 @@ func validatePlannedImageSizes(c config.Config, p Plan) error {
 	}
 	return nil
 }
-func inspectActions(ctx context.Context, c config.Config, api Client, p Plan) (map[string]bool, map[string]string, map[string][]drawioTextUpdate, error) {
+func inspectActions(ctx context.Context, c config.Config, api Client, p Plan, progress ...func(string, ...any)) (map[string]bool, map[string]string, map[string][]drawioTextUpdate, error) {
 	skipped := map[string]bool{}
 	appendOnly := map[string]string{}
 	preservedDrawio := map[string][]drawioTextUpdate{}
 	for _, action := range p.Actions {
+		if len(progress) > 0 && progress[0] != nil && (action.Kind == "images-update" || c.Sync.DrawioEmbed && action.Kind == "update" && len(action.Entry.managedEmbeds) > 0) {
+			progress[0]("checking media: %s", action.Path)
+		}
 		if action.Kind == "images-update" {
 			m, err := getMarkdown(ctx, api, action.Entry.PageID)
 			if err != nil {
@@ -917,7 +1042,7 @@ func inspectActions(ctx context.Context, c config.Config, api Client, p Plan) (m
 }
 
 func previewActions(ctx context.Context, c config.Config, api Client, p Plan, print func(string, ...any)) error {
-	skipped, _, _, err := inspectActions(ctx, c, api, p)
+	skipped, _, _, err := inspectActions(ctx, c, api, p, print)
 	if err != nil {
 		return err
 	}
@@ -970,8 +1095,46 @@ func recordSkipped(s *State, p Plan, skipped map[string]bool, print func(string,
 	}
 }
 
+// Rebuild only pages whose resolved Markdown changed or whose page was just
+// created. All other actions keep their original, already checked plan.
+func rebuildAfterCreation(ctx context.Context, c config.Config, api Client, files []File, s State, original Plan, print func(string, ...any), overwrite ...bool) (Plan, error) {
+	byKey := make(map[string]Action, len(original.Actions))
+	for _, action := range original.Actions {
+		byKey[action.Key] = action
+	}
+	var changed []File
+	for _, f := range files {
+		a, ok := byKey["file:"+f.Path]
+		if ok && (a.Kind == "create" || a.File.Hash != f.Hash) {
+			changed = append(changed, f)
+		}
+	}
+	if len(changed) == 0 {
+		return original, nil
+	}
+	print("checking %d created or link-dependent page(s)", len(changed))
+	updated, err := build(ctx, c, api, changed, s, print, overwrite...)
+	if err != nil {
+		return Plan{}, err
+	}
+	if err := planPageLocks(ctx, c, api, &updated, nil, print); err != nil {
+		return Plan{}, err
+	}
+	if err := planProperties(ctx, c, api, &updated, nil, print); err != nil {
+		return Plan{}, err
+	}
+	for _, action := range updated.Actions {
+		byKey[action.Key] = action
+	}
+	result := Plan{Deleted: original.Deleted}
+	for _, action := range original.Actions {
+		result.Actions = append(result.Actions, byKey[action.Key])
+	}
+	return result, nil
+}
+
 func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, print func(string, ...any)) error {
-	skipped, appendOnly, preservedDrawio, err := inspectActions(ctx, c, api, p)
+	skipped, appendOnly, preservedDrawio, err := inspectActions(ctx, c, api, p, print)
 	if err != nil {
 		return err
 	}
@@ -1014,6 +1177,9 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 			print("warning %s: page not synchronized because existing draw.io embeds cannot be preserved safely; update the page manually", a.Path)
 			continue
 		}
+		if a.Kind != "unchanged" && a.Kind != "directory-existing" {
+			print("processing %s: %s", a.Kind, a.Path)
+		}
 		if strings.HasPrefix(a.Key, "file:") {
 			f := s.Documents[a.Path]
 			if f == nil {
@@ -1021,6 +1187,49 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 			}
 			if err := verifyFileUnchanged(c, f); err != nil {
 				return err
+			}
+		}
+		if a.propertyPlan != nil {
+			if err := applyProperties(ctx, c, api, s, a, print); err != nil {
+				return err
+			}
+		}
+		if a.Lock {
+			print("locking page: %s", a.Path)
+			page, err := getPage(ctx, api, a.Entry.PageID)
+			if err != nil {
+				return fmt.Errorf("%s: cannot check page lock: %w", a.Path, err)
+			}
+			id, kind := parentOf(page)
+			if kind != a.Entry.ParentType || norm(id) != norm(a.Entry.ParentID) || page.Locked == nil {
+				return fmt.Errorf("%s: page parent or lock status changed or could not be verified", a.Path)
+			}
+			if !*page.Locked {
+				if err := notion.LockPage(ctx, api, a.Entry.PageID); err != nil {
+					return fmt.Errorf("%s: page lock could not be verified; inspect Notion before retrying: %w", a.Path, err)
+				}
+				print("locked %s -> %s", a.Path, pageURL(a.Entry.PageID))
+			}
+		}
+		if a.IconName != "" {
+			print("setting icon %s: %s", a.IconName, a.Path)
+			page, err := getPage(ctx, api, a.Entry.PageID)
+			if err != nil {
+				return fmt.Errorf("%s: cannot check page icon: %w", a.Path, err)
+			}
+			id, kind := parentOf(page)
+			if kind != a.Entry.ParentType || norm(id) != norm(a.Entry.ParentID) || len(page.Icon) == 0 {
+				return fmt.Errorf("%s: page parent or icon could not be verified", a.Path)
+			}
+			var current *notion.Icon
+			if err := json.Unmarshal(page.Icon, &current); err != nil {
+				return fmt.Errorf("%s: invalid page icon: %w", a.Path, err)
+			}
+			if !current.Matches(a.IconName) {
+				if err := notion.SetIcon(ctx, api, a.Entry.PageID, a.IconName); err != nil {
+					return fmt.Errorf("%s: icon update could not be verified; inspect Notion before retrying: %w", a.Path, err)
+				}
+				print("set icon %s -> %s", a.Path, pageURL(a.Entry.PageID))
 			}
 		}
 		if planned, ok := preservedDrawio[a.Key]; ok {
@@ -1239,6 +1448,12 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 				propName = a.TitleProperty
 			}
 			body := map[string]any{"parent": parent, "properties": map[string]any{propName: makeTitle(a.Title)}}
+			if a.propertyPlan != nil {
+				maps.Copy(body["properties"].(map[string]any), a.propertyPlan.write)
+			}
+			if icon := requestedIcon(c, a); icon != "" {
+				body["icon"] = notion.NativeIcon(icon)
+			}
 			if a.Kind == "create" && a.Body != "" {
 				body["markdown"] = a.Body
 			}
@@ -1253,6 +1468,9 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 			s.Pending.PageID = created.ID
 			if err := saveState(c, *s); err != nil {
 				return err
+			}
+			if err := notion.LockPage(ctx, api, created.ID); err != nil {
+				return fmt.Errorf("%s: page created but lock could not be verified; pending state retained, inspect Notion before recovery: %w", a.Path, err)
 			}
 			var imageBlocks map[string]string
 			if a.Kind == "create" {
@@ -1336,6 +1554,7 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 	return nil
 }
 func Run(ctx context.Context, c config.Config, api Client, apply bool, print func(string, ...any), overwrite ...bool) error {
+	print("scanning source files: %s", c.SourcePath)
 	var unlock func()
 	if apply {
 		var err error
@@ -1365,13 +1584,13 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 		}
 	}
 	prepareLinks(files, s, c.SourcePath)
-	p, err := Build(ctx, c, api, files, s, overwrite...)
+	p, err := build(ctx, c, api, files, s, print, overwrite...)
 	if err != nil {
 		return err
 	}
 	anticipateLinkReplacements(c, s, &p)
 	allowed := allowedReplacements(p)
-	skipped, _, _, err := inspectActions(ctx, c, api, p)
+	skipped, _, _, err := inspectActions(ctx, c, api, p, print)
 	if err != nil {
 		return err
 	}
@@ -1379,6 +1598,13 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 	if err := validatePlannedImageSizes(c, activePlan); err != nil {
 		return err
 	}
+	if err := planPageLocks(ctx, c, api, &p, skipped, print); err != nil {
+		return err
+	}
+	if err := planProperties(ctx, c, api, &p, skipped, print); err != nil {
+		return err
+	}
+	activePlan = withoutSkippedActions(p, skipped)
 	printPlan(p, print)
 	if !apply {
 		if err := previewActions(ctx, c, api, p, print); err != nil {
@@ -1406,7 +1632,7 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 	shells := Plan{}
 	for _, a := range p.Actions {
 		switch a.Kind {
-		case "directory-create", "directory-existing":
+		case "directory-create":
 			shells.Actions = append(shells.Actions, a)
 		case "create":
 			a.Body = ""
@@ -1424,11 +1650,10 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 			files[i] = *s.Documents[files[i].Path]
 		}
 		prepareLinks(files, s, c.SourcePath)
-		p, err = Build(ctx, c, api, files, s, overwrite...)
+		p, err = rebuildAfterCreation(ctx, c, api, files, s, p, print, overwrite...)
 		if err != nil {
 			return err
 		}
-		p = withoutSkippedActions(p, skipped)
 		if err := validateReplacements(p, allowed); err != nil {
 			return err
 		}
@@ -1449,6 +1674,7 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 
 // RunFile limits synchronization to one scanned file; other state entries are retained.
 func RunFile(ctx context.Context, c config.Config, api Client, filename string, apply bool, print func(string, ...any), overwrite ...bool) error {
+	print("scanning source file: %s", filename)
 	var unlock func()
 	if apply {
 		var err error
@@ -1522,13 +1748,13 @@ func RunFile(ctx context.Context, c config.Config, api Client, filename string, 
 	selected[0] = *stored
 	s.Active[rel] = true
 	prepareLinks(selected, s, c.SourcePath)
-	p, err := Build(ctx, c, api, selected, s, overwrite...)
+	p, err := build(ctx, c, api, selected, s, print, overwrite...)
 	if err != nil {
 		return err
 	}
 	anticipateLinkReplacements(c, s, &p)
 	allowed := allowedReplacements(p)
-	skipped, _, _, err := inspectActions(ctx, c, api, p)
+	skipped, _, _, err := inspectActions(ctx, c, api, p, print)
 	if err != nil {
 		return err
 	}
@@ -1537,6 +1763,13 @@ func RunFile(ctx context.Context, c config.Config, api Client, filename string, 
 		return err
 	}
 	p.Deleted = nil
+	if err := planPageLocks(ctx, c, api, &p, skipped, print); err != nil {
+		return err
+	}
+	if err := planProperties(ctx, c, api, &p, skipped, print); err != nil {
+		return err
+	}
+	activePlan = withoutSkippedActions(p, skipped)
 	printPlan(p, print)
 	if !apply {
 		if err := previewActions(ctx, c, api, p, print); err != nil {
@@ -1561,7 +1794,7 @@ func RunFile(ctx context.Context, c config.Config, api Client, filename string, 
 	var shells Plan
 	for _, action := range p.Actions {
 		switch action.Kind {
-		case "directory-create", "directory-existing":
+		case "directory-create":
 			shells.Actions = append(shells.Actions, action)
 		case "create":
 			action.Body, action.TextParts, action.File.Images = "", nil, nil
@@ -1575,11 +1808,10 @@ func RunFile(ctx context.Context, c config.Config, api Client, filename string, 
 		}
 		selected[0] = *s.Documents[rel]
 		prepareLinks(selected, s, c.SourcePath)
-		p, err = Build(ctx, c, api, selected, s, overwrite...)
+		p, err = rebuildAfterCreation(ctx, c, api, selected, s, p, print, overwrite...)
 		if err != nil {
 			return err
 		}
-		p = withoutSkippedActions(p, skipped)
 		if err := validateReplacements(p, allowed); err != nil {
 			return err
 		}
@@ -1620,7 +1852,8 @@ func finishLinkSync(ctx context.Context, c config.Config, api Client, s *State, 
 	if !needsUpdate {
 		return nil
 	}
-	plan, err := Build(ctx, c, api, ready, *s, overwrite...)
+	print("checking page links after synchronization")
+	plan, err := build(ctx, c, api, ready, *s, print, overwrite...)
 	if err != nil {
 		return err
 	}

@@ -7,6 +7,12 @@ description: Use the notion-sync CLI to search and view Notion pages and databas
 
 Use `notion-sync` for local Markdown → Notion synchronization, limited explicit Notion → local pulls, and supported page/database operations. HTML comments are excluded from synchronized content but retained in the local file; code examples remain. Consult the project's README for current options and limitations; use `notion-sync <command> --help` when details are unclear. If the binary is unavailable, report the prerequisite or, from the project checkout, use `go run .` in place of `notion-sync`.
 
+New pages created by sync or create commands are locked in the Notion UI. Sync also locks existing pages in scope, including unchanged pages; dry-run previews locks. Icons are unchanged unless explicitly requested via `--icon <name>`, which sets that native Notion icon in its default color on new and existing pages in scope; dry-run previews icon changes. The lock does not prevent API updates. If locking fails after creation, inspect and lock the page in Notion as needed before recovering a pending sync creation.
+
+`--icon random` chooses from a fixed set of native Notion icons. Sync assigns a stable choice per parent and file or directory path; `--dry-run` shows that same choice. Unmanaged create commands choose randomly on each creation.
+
+Database properties can be specified per file in the `notion-properties` frontmatter mapping, or with repeatable `--property 'Name=Value with spaces'` options. CLI values override the same frontmatter fields and are written to each affected Markdown file when syncing. Preview first: specified properties replace existing values, including whole multi-select arrays. Only types listed in the README are supported. An interrupted property update may leave the local frontmatter updated; inspect both local and Notion state before retrying.
+
 ## Prerequisites
 
 Check that both `notion-sync` and the official Notion CLI `ntn` are available:

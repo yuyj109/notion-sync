@@ -19,6 +19,7 @@ const rootID = "01234567-89ab-cdef-0123-456789abcdef"
 type fakePage struct {
 	parent, content, parentType string
 	locked                      bool
+	icon                        any
 }
 type fakeAPI struct {
 	pages            map[string]*fakePage
@@ -26,6 +27,8 @@ type fakeAPI struct {
 	blockUpdates     int
 	blockUpdateBody  map[string]any
 	failCreate       bool
+	failLock         bool
+	icons            []any
 	failMarkdown     bool
 	failUpdate       bool
 	onUpdate         func()
@@ -36,6 +39,7 @@ type fakeAPI struct {
 	nextImageURL     string
 	renderImages     bool
 	events           []string
+	pageGets         map[string]int
 }
 
 func (f *fakeAPI) API(_ context.Context, method, endpoint string, body any, out any) error {
@@ -91,6 +95,7 @@ func (f *fakeAPI) API(_ context.Context, method, endpoint string, body any, out 
 			return errors.New("lost response")
 		}
 		b := body.(map[string]any)
+		f.icons = append(f.icons, b["icon"])
 		props := b["properties"].(map[string]any)
 		for _, prop := range props {
 			parts := prop.(map[string]any)["title"].([]any)
@@ -108,7 +113,10 @@ func (f *fakeAPI) API(_ context.Context, method, endpoint string, body any, out 
 		if content != "" {
 			f.events = append(f.events, "text")
 		}
-		f.pages[norm(id)] = &fakePage{parent: parent, content: content, parentType: parentType}
+		f.pages[norm(id)] = &fakePage{parent: parent, content: content, parentType: parentType, icon: b["icon"]}
+		if icon, ok := b["icon"].(map[string]any); ok {
+			icon["icon"].(map[string]any)["color"] = "gray"
+		}
 		return copyResult(map[string]any{"object": "page", "id": id, "parent": map[string]any{"type": parentType, parentType: parent}})
 	}
 	id := strings.TrimPrefix(endpoint, "v1/pages/")
@@ -119,11 +127,28 @@ func (f *fakeAPI) API(_ context.Context, method, endpoint string, body any, out 
 		return errors.New("not found")
 	}
 	if method == "GET" && !isMarkdown {
+		if f.pageGets != nil {
+			f.pageGets[norm(id)]++
+		}
 		parentType := p.parentType
 		if parentType == "" {
 			parentType = "page_id"
 		}
-		return copyResult(map[string]any{"object": "page", "id": id, "is_locked": p.locked, "parent": map[string]any{"type": parentType, parentType: p.parent}})
+		return copyResult(map[string]any{"object": "page", "id": id, "is_locked": p.locked, "icon": p.icon, "parent": map[string]any{"type": parentType, parentType: p.parent}})
+	}
+	if method == "PATCH" && !isMarkdown {
+		if f.failLock {
+			return errors.New("lock failed")
+		}
+		b := body.(map[string]any)
+		if value, ok := b["is_locked"].(bool); ok {
+			p.locked = value
+		}
+		if icon, ok := b["icon"].(map[string]any); ok {
+			icon["icon"].(map[string]any)["color"] = "gray"
+			p.icon = icon
+		}
+		return copyResult(map[string]any{"object": "page", "id": id, "is_locked": p.locked, "icon": p.icon})
 	}
 	if method == "PATCH" {
 		if f.failUpdate {
@@ -204,6 +229,208 @@ func write(t *testing.T, name, text string) {
 }
 func run(c config.Config, api *fakeAPI, apply bool) error {
 	return Run(context.Background(), c, api, apply, func(string, ...any) {})
+}
+
+func TestNewPagesUseDocumentIconAndLock(t *testing.T) {
+	c, api, dir := setup(t)
+	c.Sync.Icon = "document"
+	write(t, filepath.Join(dir, "child", "a.md"), "body\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.icons) != 2 {
+		t.Fatalf("expected directory and file pages, got %d", len(api.icons))
+	}
+	for _, icon := range api.icons {
+		data, _ := json.Marshal(icon)
+		if string(data) != `{"icon":{"color":"gray","name":"document"},"type":"icon"}` {
+			t.Fatalf("unexpected icon: %s", data)
+		}
+	}
+	for id, p := range api.pages {
+		if id != norm(rootID) && !p.locked {
+			t.Fatalf("page %s not locked", id)
+		}
+	}
+}
+
+func TestOptionalIconForExistingAndNewPages(t *testing.T) {
+	c, api, dir := setup(t)
+	write(t, filepath.Join(dir, "existing.md"), "existing\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.icons) != 1 || api.icons[0] != nil {
+		t.Fatalf("default creation unexpectedly sets icon: %v", api.icons)
+	}
+	s, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := api.pages[norm(s.Entries["file:existing.md"].PageID)]
+	write(t, filepath.Join(dir, "new.md"), "new\n")
+	c.Sync.Icon = "document"
+	var lines []string
+	print := func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
+	if err := Run(context.Background(), c, api, false, print); err != nil {
+		t.Fatal(err)
+	}
+	if page.icon != nil || !strings.Contains(strings.Join(lines, "\n"), "set icon document on existing.md") || !strings.Contains(strings.Join(lines, "\n"), "set icon document on new page: new.md") {
+		t.Fatalf("dry-run did not safely preview icons: %v", lines)
+	}
+	if err := Run(context.Background(), c, api, true, print); err != nil {
+		t.Fatal(err)
+	}
+	if page.icon == nil || len(api.icons) != 2 || api.icons[1] == nil {
+		t.Fatalf("icons were not set: existing=%v creates=%v", page.icon, api.icons)
+	}
+	lines = nil
+	if err := Run(context.Background(), c, api, false, print); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(lines, "\n"), "set icon ") {
+		t.Fatalf("already matching icons should not be updated: %v", lines)
+	}
+	c.Sync.Icon = ""
+	if err := run(c, api, true); err != nil || page.icon == nil {
+		t.Fatalf("omitting icon changed the existing icon: %v", err)
+	}
+}
+
+func TestRandomIconIsStableForSyncAndPreview(t *testing.T) {
+	c, api, dir := setup(t)
+	write(t, filepath.Join(dir, "existing.md"), "existing\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dir, "new.md"), "new\n")
+	c.Sync.Icon = "random"
+	var lines []string
+	print := func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
+	if err := Run(context.Background(), c, api, false, print); err != nil {
+		t.Fatal(err)
+	}
+	existingIcon := requestedIcon(c, Action{Key: "file:existing.md"})
+	newIcon := requestedIcon(c, Action{Key: "file:new.md"})
+	preview := strings.Join(lines, "\n")
+	if !strings.Contains(preview, "set icon "+existingIcon+" on existing.md") || !strings.Contains(preview, "set icon "+newIcon+" on new page: new.md") {
+		t.Fatalf("unexpected random preview: %s", preview)
+	}
+	if err := Run(context.Background(), c, api, true, print); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for filename, want := range map[string]string{"existing.md": existingIcon, "new.md": newIcon} {
+		icon := api.pages[norm(s.Entries["file:"+filename].PageID)].icon.(map[string]any)
+		if got := icon["icon"].(map[string]any)["name"]; got != want {
+			t.Fatalf("%s: icon = %v, want %s", filename, got, want)
+		}
+	}
+	lines = nil
+	if err := Run(context.Background(), c, api, false, print); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(lines, "\n"), "set icon ") {
+		t.Fatalf("random icons changed on second sync: %v", lines)
+	}
+}
+
+func TestLockFailureKeepsKnownPendingPage(t *testing.T) {
+	c, api, dir := setup(t)
+	write(t, filepath.Join(dir, "a.md"), "body\n")
+	api.failLock = true
+	if err := run(c, api, true); err == nil || !strings.Contains(err.Error(), "lock could not be verified") {
+		t.Fatalf("expected lock failure, got %v", err)
+	}
+	s, err := loadStateWithPending(c, true)
+	if err != nil || s.Pending == nil || s.Pending.PageID == "" || api.creates != 1 {
+		t.Fatalf("pending page not retained: %+v, %v", s.Pending, err)
+	}
+}
+
+func TestSyncLocksExistingPagesIncludingUnchanged(t *testing.T) {
+	c, api, dir := setup(t)
+	write(t, filepath.Join(dir, "a.md"), "body\n")
+	write(t, filepath.Join(dir, "b.md"), "body\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a.md", "b.md"} {
+		api.pages[norm(s.Entries["file:"+name].PageID)].locked = false
+	}
+	write(t, filepath.Join(dir, "b.md"), string(mustRead(t, filepath.Join(dir, "b.md")))+"updated\n")
+	var lines []string
+	print := func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
+	if err := Run(context.Background(), c, api, false, print); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a.md", "b.md"} {
+		if api.pages[norm(s.Entries["file:"+name].PageID)].locked || !strings.Contains(strings.Join(lines, "\n"), "lock "+name+" ->") {
+			t.Fatalf("dry run did not preview lock for %s", name)
+		}
+	}
+	if err := Run(context.Background(), c, api, true, print); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a.md", "b.md"} {
+		if !api.pages[norm(s.Entries["file:"+name].PageID)].locked {
+			t.Fatalf("%s is not locked", name)
+		}
+	}
+}
+
+func TestSyncShowsProgressBeforePlan(t *testing.T) {
+	c, api, dir := setup(t)
+	write(t, filepath.Join(dir, "a.md"), "body\n")
+	var lines []string
+	if err := Run(context.Background(), c, api, false, func(format string, args ...any) {
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(lines, "\n")
+	for _, text := range []string{"scanning source files:", "checking destination in Notion", "checking page 1/1: a.md", "create a.md"} {
+		if !strings.Contains(joined, text) {
+			t.Fatalf("missing progress %q in %s", text, joined)
+		}
+	}
+	if strings.Index(joined, "checking page 1/1") > strings.Index(joined, "create a.md") {
+		t.Fatalf("plan was printed before progress: %s", joined)
+	}
+}
+
+func TestCreatingPageDoesNotRecheckUnrelatedPages(t *testing.T) {
+	c, api, dir := setup(t)
+	write(t, filepath.Join(dir, "existing.md"), "existing\n")
+	if err := run(c, api, true); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadState(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existingID := norm(s.Entries["file:existing.md"].PageID)
+	api.pageGets = map[string]int{}
+	write(t, filepath.Join(dir, "new.md"), "new\n")
+	var lines []string
+	if err := Run(context.Background(), c, api, true, func(format string, args ...any) {
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if api.pageGets[existingID] != 1 {
+		t.Fatalf("existing page checked %d times, want 1", api.pageGets[existingID])
+	}
+	if strings.Count(strings.Join(lines, "\n"), "checking page 1/2: existing.md") != 1 {
+		t.Fatalf("unexpected progress: %v", lines)
+	}
 }
 
 func TestSyncResolvesRelativeLinksAfterCreatingPages(t *testing.T) {
@@ -785,7 +1012,7 @@ func TestLocalImageScanAndCreate(t *testing.T) {
 	if api.pages[norm(s.Entries["file:guide.md"].PageID)].content != "# Guide\nBefore updated\nAfter" {
 		t.Fatal("combined update did not preserve text order")
 	}
-	if len(completed) != 1 || !strings.Contains(completed[0], "images replaced: 1") {
+	if !strings.Contains(strings.Join(completed, "\n"), "images replaced: 1") {
 		t.Fatalf("combined update output=%v", completed)
 	}
 	if s.Entries["file:guide.md"].ImageBlocks["image-1"] == "" {

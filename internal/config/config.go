@@ -9,6 +9,8 @@ type Config struct {
 	Source string
 	Notion struct{ ParentID, ParentType, ParentPageID, ParentDatabaseID string }
 	Sync   struct {
+		Icon                string
+		Properties          map[string]string
 		Direction           string
 		MetadataFormat      string
 		PreserveHierarchy   bool

@@ -15,15 +15,16 @@ import (
 )
 
 type Entry struct {
-	managedEmbeds map[string]bool
-	PageID        string            `json:"pageId" yaml:"page-id"`
-	ParentID      string            `json:"parentId" yaml:"parent-id"`
-	ParentType    string            `json:"parentType" yaml:"parent-type"`
-	Target        string            `json:"target" yaml:"target"`
-	LocalHash     string            `json:"localHash,omitempty" yaml:"local-hash,omitempty"`
-	RemoteHash    string            `json:"remoteHash,omitempty" yaml:"remote-hash,omitempty"`
-	ImageHashes   map[string]string `json:"imageHashes,omitempty" yaml:"image-hashes,omitempty"`
-	ImageBlocks   map[string]string `json:"imageBlocks,omitempty" yaml:"image-blocks,omitempty"`
+	managedEmbeds     map[string]bool
+	overwriteSnapshot string
+	PageID            string            `json:"pageId" yaml:"page-id"`
+	ParentID          string            `json:"parentId" yaml:"parent-id"`
+	ParentType        string            `json:"parentType" yaml:"parent-type"`
+	Target            string            `json:"target" yaml:"target"`
+	LocalHash         string            `json:"localHash,omitempty" yaml:"local-hash,omitempty"`
+	RemoteHash        string            `json:"remoteHash,omitempty" yaml:"remote-hash,omitempty"`
+	ImageHashes       map[string]string `json:"imageHashes,omitempty" yaml:"image-hashes,omitempty"`
+	ImageBlocks       map[string]string `json:"imageBlocks,omitempty" yaml:"image-blocks,omitempty"`
 }
 type Pending struct {
 	Key      string `json:"key" yaml:"key"`

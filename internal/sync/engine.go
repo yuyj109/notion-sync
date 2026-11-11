@@ -91,13 +91,14 @@ type Action struct {
 	Entry                                                                             Entry
 	Body                                                                              string
 	TextParts                                                                         []string
-	Overwrite, ForceReplace, LinkDependent                                            bool
+	Overwrite, ForceReplace, LinkDependent, RemoveMedia                               bool
 	Lock                                                                              bool
 	lockStatus                                                                        *bool
 	iconStatus                                                                        json.RawMessage
 	IconName                                                                          string
 	creationIcon                                                                      string
 	propertyPlan                                                                      *propertyPlan
+	drawioMigrations                                                                  []drawioMigration
 	ConflictDiff                                                                      string
 	ConflictDiffNumbered                                                              string
 }
@@ -215,6 +216,9 @@ func validateExistingPage(ctx context.Context, api Client, e Entry) (markdown, p
 		return m, p, err
 	}
 	if remoteMarkdownHash(m.Markdown) != e.RemoteHash {
+		if e.overwriteSnapshot != "" && overwriteMarkdownHash(m.Markdown) == e.overwriteSnapshot {
+			return m, p, nil
+		}
 		if len(e.managedEmbeds) == 0 {
 			return m, p, &remoteChangedError{pageID: e.PageID}
 		}
@@ -474,7 +478,15 @@ func build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 				a.Overwrite = true
 				a.ConflictDiff = changed.diff
 				a.ConflictDiffNumbered = changed.numberedDiff
-				e.RemoteHash = remoteMarkdownHash(m.Markdown)
+				baseline := m.Markdown
+				if len(e.managedEmbeds) > 0 {
+					baseline, _, err = normalizeManagedEmbeds(ctx, api, e, baseline)
+					if err != nil {
+						return plan, fmt.Errorf("%s: %w", f.Path, err)
+					}
+				}
+				e.RemoteHash = remoteMarkdownHash(baseline)
+				e.overwriteSnapshot = overwriteMarkdownHash(m.Markdown)
 				a.Entry = e
 			}
 			switch {
@@ -548,9 +560,19 @@ func build(ctx context.Context, c config.Config, api Client, files []File, s Sta
 			}
 			a.Kind = "create"
 		}
+		if len(overwrite) > 0 && overwrite[0] && a.Kind == "update" && len(a.Entry.ImageHashes) > len(a.File.Images) {
+			a.RemoveMedia, a.ForceReplace = true, true
+		}
 		if c.Sync.ReplaceDrawioEmbeds && c.Sync.DrawioEmbed && len(a.Entry.managedEmbeds) > 0 && (a.Kind == "update" || a.Kind == "images-update") {
 			a.ForceReplace = true
 			a.Kind = "update"
+		}
+		if c.Sync.DrawioEmbed {
+			var err error
+			a.drawioMigrations, err = planDrawioMigrations(ctx, api, a)
+			if err != nil {
+				return plan, fmt.Errorf("%s: plan draw.io HTML migration: %w", a.Path, err)
+			}
 		}
 		plan.Actions = append(plan.Actions, a)
 	}
@@ -587,7 +609,14 @@ func appendImages(ctx context.Context, api Client, pageID string, action Action,
 		var child map[string]any
 		if c.Sync.DrawioEmbed && isDrawioSVG(image) {
 			blockType = "embed"
-			child = map[string]any{"object": "block", "type": "embed", "embed": map[string]any{"url": ""}}
+			uploadID, err := uploadDrawioHTML(ctx, uploader, image, full)
+			if err != nil {
+				return nil, fmt.Errorf("%s: HTML upload failed or outcome uncertain; inspect Notion before retry: %w", action.Path, err)
+			}
+			if err := verifyImageUnchanged(full, image.Hash); err != nil {
+				return nil, fmt.Errorf("%s: file changed during HTML upload; inspect Notion before retrying: %w", action.Path, err)
+			}
+			child = map[string]any{"object": "block", "type": "embed", "embed": map[string]any{"type": "file_upload", "file_upload": map[string]any{"id": uploadID}, "caption": image.Caption}}
 		} else {
 			uploadID, err := uploadImage(ctx, uploader, image, full)
 			if err != nil {
@@ -800,17 +829,31 @@ func printPlan(p Plan, print func(string, ...any)) {
 				}
 			}
 			switch {
+			case a.RemoveMedia:
+				print("overwrite %s -> %s (all page content replaced; removed media deleted; remaining media recreated)", a.Path, destination)
+				if a.ConflictDiff != "" {
+					print("%s", DiffOutput{Plain: a.ConflictDiff, Numbered: a.ConflictDiffNumbered})
+				}
 			case a.ForceReplace:
 				if a.LinkDependent {
-					print("overwrite %s -> %s (new page links will change; all page content replaced; draw.io embeds recreated empty)", a.Path, destination)
+					print("overwrite %s -> %s (new page links will change; all page content replaced; draw.io embeds recreated from uploaded HTML)", a.Path, destination)
 				} else {
-					print("overwrite %s -> %s (all page content replaced; draw.io embeds recreated empty)", a.Path, destination)
+					print("overwrite %s -> %s (all page content replaced; draw.io embeds recreated from uploaded HTML)", a.Path, destination)
 				}
 				if a.ConflictDiff != "" {
 					print("%s", DiffOutput{Plain: a.ConflictDiff, Numbered: a.ConflictDiffNumbered})
 				}
+			case len(a.drawioMigrations) > 0:
+				print("update draw.io HTML (%d) %s -> %s (legacy URL embeds migrated; existing blocks retained)", len(a.drawioMigrations), a.Path, destination)
+				if a.Kind == "update" || a.Kind == "images-update" {
+					print("%s %s -> %s (other planned content changes)", a.Kind, a.Path, destination)
+				}
 			case a.Overwrite:
-				print("overwrite %s -> %s (Notion content changed)", a.Path, destination)
+				if len(a.Entry.managedEmbeds) == 0 {
+					print("overwrite %s -> %s (Notion content changed; all page content replaced)", a.Path, destination)
+				} else {
+					print("overwrite %s -> %s (Notion content changed)", a.Path, destination)
+				}
 				if a.ConflictDiff != "" {
 					print("%s", DiffOutput{Plain: a.ConflictDiff, Numbered: a.ConflictDiffNumbered})
 				}
@@ -1014,7 +1057,7 @@ func inspectActions(ctx context.Context, c config.Config, api Client, p Plan, pr
 				return nil, nil, nil, err
 			}
 		}
-		if action.ForceReplace && len(action.Entry.ImageHashes) > len(action.File.Images) {
+		if action.ForceReplace && !action.RemoveMedia && len(action.Entry.ImageHashes) > len(action.File.Images) {
 			return nil, nil, nil, fmt.Errorf("%s: removing local images from an existing page is not supported", action.Path)
 		}
 		if c.Sync.DrawioEmbed && !action.ForceReplace && action.Kind == "update" && len(action.Entry.managedEmbeds) > 0 {
@@ -1082,7 +1125,7 @@ func skippedError(s State) error {
 	return fmt.Errorf("%d page(s) were skipped: %s", len(paths), strings.Join(paths, ", "))
 }
 
-// Exclude skipped actions from work that precedes Apply, including URL exports.
+// Exclude skipped actions from work that precedes Apply, including HTML exports.
 func withoutSkippedActions(p Plan, skipped map[string]bool) Plan {
 	filtered := Plan{Deleted: p.Deleted}
 	for _, action := range p.Actions {
@@ -1152,6 +1195,17 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 	for _, action := range p.Actions {
 		if skipped[action.Key] {
 			continue
+		}
+		if len(action.drawioMigrations) > 0 {
+			if _, ok := api.(MultipartClient); !ok {
+				return fmt.Errorf("%s: Notion client does not support HTML uploads", action.Path)
+			}
+			for _, migration := range action.drawioMigrations {
+				image := migration.Image
+				if err := verifyImageUnchanged(filepath.Join(c.SourcePath, filepath.FromSlash(image.Path)), image.Hash); err != nil {
+					return err
+				}
+			}
 		}
 		if _, ok := preservedDrawio[action.Key]; ok {
 			continue
@@ -1241,6 +1295,11 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 					return fmt.Errorf("%s: icon update could not be verified; inspect Notion before retrying: %w", a.Path, err)
 				}
 				print("set icon %s -> %s", a.Path, pageURL(a.Entry.PageID))
+			}
+		}
+		if !a.ForceReplace && len(a.drawioMigrations) > 0 {
+			if err := applyDrawioMigrations(ctx, c, api, s, &a, print); err != nil {
+				return fmt.Errorf("%s: %w", a.Path, err)
 			}
 		}
 		if planned, ok := preservedDrawio[a.Key]; ok {
@@ -1497,13 +1556,17 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 				if err != nil {
 					return fmt.Errorf("%s: created but readback failed; pending state retained: %w", a.Path, err)
 				}
-				e.RemoteHash = remoteMarkdownHash(m.Markdown)
 				e.LocalHash = a.File.Hash
 				e.ImageHashes = imageHashMap(a.File.Images)
 				e.ImageBlocks = imageBlocks
 				if c.Sync.DrawioEmbed {
 					trackDrawioEmbeds(&e, a.File.Images)
+					m.Markdown, _, err = normalizeManagedEmbedsIfPresent(ctx, api, e, m.Markdown)
+					if err != nil {
+						return fmt.Errorf("%s: created but HTML readback failed; pending state retained: %w", a.Path, err)
+					}
 				}
+				e.RemoteHash = remoteMarkdownHash(m.Markdown)
 			}
 			s.Entries[a.Key] = e
 			s.Pending = nil
@@ -1527,6 +1590,7 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 			if issue := markdownUpdateIssue(updated, e.PageID); issue != "" {
 				return fmt.Errorf("%s: update returned warnings or incomplete content: %s; inspect Notion before retrying", a.Path, issue)
 			}
+			responseMarkdown := updated.Markdown
 			if len(a.File.Images) == 0 {
 				e.ImageHashes = nil
 				e.ImageBlocks = nil
@@ -1544,9 +1608,20 @@ func Apply(ctx context.Context, c config.Config, api Client, s *State, p Plan, p
 				if c.Sync.DrawioEmbed {
 					trackDrawioEmbeds(&e, a.File.Images)
 				}
-				updated, err = getMarkdown(ctx, api, e.PageID)
+			}
+			// The update response can differ from the subsequently retrieved
+			// Markdown even when no media was attached. Persist the readback.
+			updated, err = getMarkdown(ctx, api, e.PageID)
+			if err != nil {
+				return fmt.Errorf("%s: updated but final content readback failed; inspect Notion: %w", a.Path, err)
+			}
+			if len(a.File.Images) == 0 && remoteMarkdownHash(strings.TrimSpace(responseMarkdown)) != remoteMarkdownHash(strings.TrimSpace(updated.Markdown)) {
+				return fmt.Errorf("%s: page content changed after update; inspect Notion before retrying", a.Path)
+			}
+			if c.Sync.DrawioEmbed {
+				updated.Markdown, _, err = normalizeManagedEmbedsIfPresent(ctx, api, e, updated.Markdown)
 				if err != nil {
-					return fmt.Errorf("%s: updated but final content readback failed; inspect Notion: %w", a.Path, err)
+					return fmt.Errorf("%s: updated but HTML readback failed; inspect Notion: %w", a.Path, err)
 				}
 			}
 			e.LocalHash = a.File.Hash
@@ -1629,7 +1704,7 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 		recordSkipped(&s, p, skipped, print)
 	}
 	if c.Sync.DrawioEmbed {
-		if err := exportDrawioURL(c, activePlan, apply, print); err != nil {
+		if err := exportDrawioHTML(c, activePlan, apply, print); err != nil {
 			return err
 		}
 	}
@@ -1672,7 +1747,7 @@ func Run(ctx context.Context, c config.Config, api Client, apply bool, print fun
 			return err
 		}
 		if c.Sync.DrawioEmbed {
-			if err := exportDrawioURL(c, p, true, print); err != nil {
+			if err := exportDrawioHTML(c, p, true, print); err != nil {
 				return err
 			}
 		}
@@ -1797,7 +1872,7 @@ func RunFile(ctx context.Context, c config.Config, api Client, filename string, 
 		recordSkipped(&s, p, skipped, print)
 	}
 	if c.Sync.DrawioEmbed {
-		if err := exportDrawioURL(c, activePlan, apply, print); err != nil {
+		if err := exportDrawioHTML(c, activePlan, apply, print); err != nil {
 			return err
 		}
 	}
@@ -1833,7 +1908,7 @@ func RunFile(ctx context.Context, c config.Config, api Client, filename string, 
 			return err
 		}
 		if c.Sync.DrawioEmbed {
-			if err := exportDrawioURL(c, p, true, print); err != nil {
+			if err := exportDrawioHTML(c, p, true, print); err != nil {
 				return err
 			}
 		}
@@ -1878,7 +1953,7 @@ func finishLinkSync(ctx context.Context, c config.Config, api Client, s *State, 
 		return err
 	}
 	if c.Sync.DrawioEmbed {
-		if err := exportDrawioURL(c, plan, true, print); err != nil {
+		if err := exportDrawioHTML(c, plan, true, print); err != nil {
 			return err
 		}
 	}

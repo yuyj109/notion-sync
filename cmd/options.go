@@ -27,7 +27,7 @@ func (o *runtimeOptions) addFlags(root *cobra.Command) {
 	f.StringVar(&o.parentID, "parent-id", "", "default Notion parent page or database ID (not URL or title)")
 	f.StringVar(&o.parentType, "parent-type", "auto", "parent type: auto, page, or db")
 	f.BoolVar(&o.preserve, "preserve-hierarchy", true, "reproduce directory hierarchy for page parents (databases are flat)")
-	f.BoolVar(&o.drawioEmbed, "drawio-embed", false, "export draw.io viewer URLs and create empty embeds")
+	f.BoolVar(&o.drawioEmbed, "drawio-embed", false, "generate draw.io HTML and upload it as Notion HTML embeds")
 	f.StringVar(&o.metadataFormat, "metadata-format", config.DefaultMetadataFormat, "metadata format: frontmatter or comment")
 	f.StringVar(&o.icon, "icon", "", "set native Notion icon by name, or random, on synchronized or created pages")
 	f.StringArrayVar(&o.properties, "property", nil, "set database property as NAME=VALUE (repeatable)")

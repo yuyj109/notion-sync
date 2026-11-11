@@ -61,7 +61,7 @@ func addSyncCommands(root *cobra.Command, opts *runtimeOptions) {
 		if name == "sync" {
 			c.Flags().BoolVar(&dryRun, "dry-run", false, "show changes without writing")
 			c.Flags().BoolVar(&push, "push", false, "overwrite conflicting Notion content")
-			c.Flags().BoolVar(&replaceDrawio, "replace-drawio-embeds", false, "with --push and --drawio-embed, recreate embeds empty on updated pages")
+			c.Flags().BoolVar(&replaceDrawio, "replace-drawio-embeds", false, "with --push and --drawio-embed, recreate HTML embeds on updated pages")
 			c.Flags().BoolVar(&overwrite, "overwrite", false, "alias for --push")
 			_ = c.Flags().MarkHidden("overwrite")
 			c.Flags().BoolVar(&pull, "pull", false, "import supported changes from conflicting Notion pages into local files")

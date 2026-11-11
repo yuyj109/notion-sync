@@ -2,10 +2,7 @@ package sync
 
 import (
 	"bytes"
-	"compress/flate"
 	"context"
-	"encoding/base64"
-	"encoding/xml"
 	"fmt"
 	"html"
 	"net/url"
@@ -17,10 +14,70 @@ import (
 	"strings"
 
 	"github.com/yuyj109/notion-sync/internal/config"
+	"github.com/yuyj109/notion-sync/internal/drawio"
 )
 
-var embedMarkdown = regexp.MustCompile(`(?s)<embed\b[^>]*>\s*</embed>`)
+var embedMarkdown = regexp.MustCompile(`(?s)<embed\b[^>]*>.*?</embed>`)
 var embedSrc = regexp.MustCompile(`\bsrc\s*=\s*("[^"]*"|'[^']*')`)
+
+func normalizeManagedEmbedsIfPresent(ctx context.Context, api Client, entry Entry, body string) (string, bool, error) {
+	if len(entry.managedEmbeds) == 0 {
+		return body, false, nil
+	}
+	return normalizeManagedEmbeds(ctx, api, entry, body)
+}
+
+// Upload a fresh rendering, never a potentially edited exported HTML file.
+func uploadDrawioHTML(ctx context.Context, uploader MultipartClient, image Image, filename string) (string, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return "", err
+	}
+	if hash(string(data)) != image.Hash {
+		return "", fmt.Errorf("image changed during sync: %s", image.Path)
+	}
+	content, err := drawio.Render(data, image.Name)
+	if err != nil {
+		return "", err
+	}
+	dir, err := os.MkdirTemp("", "notion-sync-html-*")
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	name := image.Name + ".html"
+	prepared := filepath.Join(dir, name)
+	if err := os.WriteFile(prepared, content, 0600); err != nil {
+		return "", err
+	}
+	return uploader.Upload(ctx, name, "text/html", prepared)
+}
+
+// Compare an explicitly approved remote snapshot without treating refreshed
+// Notion file signatures as content changes. Other URLs remain exact.
+func overwriteMarkdownHash(body string) string {
+	protected := protectedMarkdown(body)
+	var out strings.Builder
+	last := 0
+	for _, loc := range embedMarkdown.FindAllStringIndex(body, -1) {
+		out.WriteString(body[last:loc[0]])
+		value := body[loc[0]:loc[1]]
+		if !protected[loc[0]] {
+			src := embedSrc.FindStringSubmatchIndex(value)
+			if src != nil {
+				raw := html.UnescapeString(value[src[2]+1 : src[3]-1])
+				u, err := url.Parse(raw)
+				if err == nil && isNotionSignedImageURL(u) && normalizeImageURL(u, false, 0) {
+					value = value[:src[2]+1] + html.EscapeString(u.String()) + value[src[3]-1:]
+				}
+			}
+		}
+		out.WriteString(value)
+		last = loc[1]
+	}
+	out.WriteString(body[last:])
+	return remoteMarkdownHash(out.String())
+}
 
 // normalizeManagedEmbeds ignores URLs only for the exact block IDs we created.
 // Refuse ambiguous pagination or Markdown layouts instead of masking other edits.
@@ -482,94 +539,7 @@ func imageHashesPreservingDrawio(images []Image, entry Entry) map[string]string 
 	return hashes
 }
 
-type drawioDiagram struct {
-	Name    string `xml:"name,attr,omitempty"`
-	ID      string `xml:"id,attr,omitempty"`
-	Content string `xml:",innerxml"`
-}
-
-func encodeDrawioXML(data string) (string, error) {
-	var source struct {
-		XMLName  xml.Name        `xml:"mxfile"`
-		Diagrams []drawioDiagram `xml:"diagram"`
-	}
-	if err := xml.Unmarshal([]byte(data), &source); err != nil || len(source.Diagrams) == 0 {
-		return "", fmt.Errorf("invalid embedded draw.io diagram")
-	}
-	var result strings.Builder
-	result.WriteString("<mxfile>")
-	for _, diagram := range source.Diagrams {
-		inner := strings.TrimSpace(diagram.Content)
-		if strings.HasPrefix(inner, "<") {
-			var graph struct{ XMLName xml.Name }
-			if err := xml.Unmarshal([]byte(inner), &graph); err != nil || graph.XMLName.Local != "mxGraphModel" {
-				return "", fmt.Errorf("unsupported draw.io diagram content")
-			}
-			encoded := strings.ReplaceAll(url.QueryEscape(inner), "+", "%20")
-			var compressed bytes.Buffer
-			writer, err := flate.NewWriter(&compressed, flate.BestCompression)
-			if err != nil {
-				return "", err
-			}
-			if _, err := writer.Write([]byte(encoded)); err != nil {
-				return "", err
-			}
-			if err := writer.Close(); err != nil {
-				return "", err
-			}
-			inner = base64.StdEncoding.EncodeToString(compressed.Bytes())
-		} else if _, err := base64.StdEncoding.DecodeString(inner); err != nil || inner == "" {
-			return "", fmt.Errorf("unsupported draw.io compressed diagram")
-		}
-		result.WriteString("<diagram")
-		for _, attr := range []struct{ name, value string }{{"name", diagram.Name}, {"id", diagram.ID}} {
-			if attr.value != "" {
-				result.WriteByte(' ')
-				result.WriteString(attr.name)
-				result.WriteString(`="`)
-				if err := xml.EscapeText(&result, []byte(attr.value)); err != nil {
-					return "", err
-				}
-				result.WriteByte('"')
-			}
-		}
-		result.WriteByte('>')
-		result.WriteString(inner)
-		result.WriteString("</diagram>")
-	}
-	result.WriteString("</mxfile>")
-	return result.String(), nil
-}
-
-func drawioViewerURL(data []byte, filename string) ([]byte, error) {
-	decoder := xml.NewDecoder(bytes.NewReader(data))
-	for {
-		token, err := decoder.Token()
-		if err != nil {
-			return nil, fmt.Errorf("cannot read draw.io SVG: %w", err)
-		}
-		root, ok := token.(xml.StartElement)
-		if !ok {
-			continue
-		}
-		if root.Name.Space != "http://www.w3.org/2000/svg" || root.Name.Local != "svg" {
-			return nil, fmt.Errorf("draw.io file is not an SVG")
-		}
-		for _, attr := range root.Attr {
-			if attr.Name.Space == "" && attr.Name.Local == "content" {
-				encoded, err := encodeDrawioXML(attr.Value)
-				if err != nil {
-					return nil, err
-				}
-				viewer := "https://viewer.diagrams.net/?border=0&tags=%7B%7D&lightbox=1&highlight=0000ff&edit=_blank&layers=1&nav=1&title=" + url.QueryEscape(filename) + "&dark=auto#R" + strings.ReplaceAll(url.QueryEscape(encoded), "+", "%20")
-				return []byte(viewer + "\n"), nil
-			}
-		}
-		return nil, fmt.Errorf("draw.io SVG has no embedded diagram data")
-	}
-}
-
-func exportDrawioURL(c config.Config, p Plan, write bool, print func(string, ...any)) error {
+func exportDrawioHTML(c config.Config, p Plan, write bool, print func(string, ...any)) error {
 	outputs := map[string][]byte{}
 	var dir string
 	for _, action := range p.Actions {
@@ -578,8 +548,8 @@ func exportDrawioURL(c config.Config, p Plan, write bool, print func(string, ...
 				continue
 			}
 			restore := false
-			if !action.ForceReplace && action.Entry.managedEmbeds[norm(action.Entry.ImageBlocks[imageStateKey(image)])] {
-				// A changed diagram may no longer match the URL in the existing embed.
+			if !action.ForceReplace && !migratingDrawio(action, image) && action.Entry.managedEmbeds[norm(action.Entry.ImageBlocks[imageStateKey(image)])] {
+				// A changed diagram may no longer match the HTML in the existing embed.
 				if action.Entry.ImageHashes[imageStateKey(image)] != hash("drawio-embed:"+image.Hash) {
 					continue
 				}
@@ -590,9 +560,9 @@ func exportDrawioURL(c config.Config, p Plan, write bool, print func(string, ...
 						return fmt.Errorf("locate draw.io output directory: %w", err)
 					}
 				}
-				_, err := os.Lstat(filepath.Join(dir, image.Name+".txt"))
+				_, err := os.Lstat(filepath.Join(dir, image.Name+".html"))
 				if err == nil {
-					continue // Preserve the existing URL file, regardless of its contents.
+					continue // Preserve the existing HTML file, regardless of its contents.
 				}
 				if !os.IsNotExist(err) {
 					return err
@@ -610,22 +580,19 @@ func exportDrawioURL(c config.Config, p Plan, write bool, print func(string, ...
 			if hash(string(data)) != image.Hash {
 				return fmt.Errorf("image changed during sync: %s", image.Path)
 			}
-			content, err := drawioViewerURL(data, image.Name)
+			content, err := drawio.Render(data, image.Name)
 			if err != nil {
 				if restore {
 					if print != nil {
-						print("warning %s: cannot restore draw.io viewer URL: %v", image.Path, err)
+						print("warning %s: cannot restore draw.io HTML: %v", image.Path, err)
 					}
 					continue
 				}
 				return fmt.Errorf("%s: %w", image.Path, err)
 			}
-			if len(content)-1 > 2000 && print != nil {
-				print("warning %s: viewer URL is %d characters; Notion may reject long URLs", image.Path, len(content)-1)
-			}
-			name := image.Name + ".txt"
+			name := image.Name + ".html"
 			if prior, ok := outputs[name]; ok && !bytes.Equal(prior, content) {
-				return fmt.Errorf("draw.io URL output filename collision: %s", name)
+				return fmt.Errorf("draw.io HTML output filename collision: %s", name)
 			}
 			outputs[name] = content
 		}
@@ -641,14 +608,14 @@ func exportDrawioURL(c config.Config, p Plan, write bool, print func(string, ...
 		}
 	}
 	if print != nil {
-		print("draw.io viewer URL output directory: %s", dir)
+		print("draw.io HTML output directory: %s", dir)
 		names := make([]string, 0, len(outputs))
 		for name := range outputs {
 			names = append(names, name)
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			print("draw.io viewer URL output: %s", filepath.Join(dir, name))
+			print("draw.io HTML output: %s", filepath.Join(dir, name))
 		}
 	}
 	info, err := os.Lstat(dir)
@@ -706,9 +673,6 @@ func exportDrawioURL(c config.Config, p Plan, write bool, print func(string, ...
 		}
 		if closeErr != nil {
 			return closeErr
-		}
-		if print != nil {
-			print("draw.io viewer URL: %s", strings.TrimSuffix(string(content), "\n"))
 		}
 	}
 	return nil

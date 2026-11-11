@@ -72,7 +72,7 @@ func addPageCommands(root *cobra.Command, opts *runtimeOptions) {
 			c.Flags().BoolVar(&dry, "dry-run", false, "show changes without writing")
 			c.Flags().BoolVar(&push, "push", false, "overwrite conflicting Notion content")
 			c.Flags().BoolVar(&pull, "pull", false, "import supported Notion changes into this file")
-			c.Flags().BoolVar(&replaceDrawio, "replace-drawio-embeds", false, "with --push and --drawio-embed, recreate embeds empty on updated pages")
+			c.Flags().BoolVar(&replaceDrawio, "replace-drawio-embeds", false, "with --push and --drawio-embed, recreate HTML embeds on updated pages")
 			c.Flags().BoolVar(&overwrite, "overwrite", false, "alias for --push")
 			_ = c.Flags().MarkHidden("overwrite")
 		}

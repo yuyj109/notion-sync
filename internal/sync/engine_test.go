@@ -1770,3 +1770,63 @@ func TestPlanFormatsParentURL(t *testing.T) {
 		t.Fatalf("got %v, want %s", lines, want)
 	}
 }
+
+type textReadbackClient struct {
+	*fakeAPI
+	failReadback bool
+	concurrent   bool
+}
+
+func (c *textReadbackClient) API(ctx context.Context, method, endpoint string, body any, out any) error {
+	if err := c.fakeAPI.API(ctx, method, endpoint, body, out); err != nil {
+		return err
+	}
+	if method == "PATCH" && strings.HasSuffix(endpoint, "/markdown") {
+		pageID := strings.TrimSuffix(strings.TrimPrefix(endpoint, "v1/pages/"), "/markdown")
+		c.pages[norm(pageID)].content = strings.TrimSuffix(c.pages[norm(pageID)].content, "\n")
+		if c.failReadback {
+			c.failMarkdown = true
+		}
+		if c.concurrent {
+			c.pages[norm(pageID)].content += "\nconcurrent edit"
+		}
+	}
+	return nil
+}
+
+func TestTextOnlyReplacementUsesFinalReadback(t *testing.T) {
+	for _, mode := range []string{"success", "readback failure", "concurrent edit"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg, base, dir := setup(t)
+			write(t, filepath.Join(dir, "home.md"), "# New\n")
+			state, err := loadState(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := "11111111-1111-1111-1111-111111111111"
+			base.pages[norm(id)] = &fakePage{parent: rootID, parentType: "page_id", content: "# Old"}
+			entry := Entry{PageID: id, ParentID: rootID, ParentType: "page_id", Target: "hierarchy:", LocalHash: "old", RemoteHash: remoteMarkdownHash("# Old")}
+			state.Active["home.md"] = true
+			state.Entries["file:home.md"] = entry
+			file := *state.Documents["home.md"]
+			action := Action{Kind: "update", Key: "file:home.md", Path: "home.md", Entry: entry, File: file, Body: file.SyncBody}
+			client := &textReadbackClient{fakeAPI: base, failReadback: mode == "readback failure", concurrent: mode == "concurrent edit"}
+			err = Apply(context.Background(), cfg, client, &state, Plan{Actions: []Action{action}}, func(string, ...any) {})
+			if mode != "success" {
+				if err == nil || state.Entries[action.Key].RemoteHash != entry.RemoteHash {
+					t.Fatalf("failed readback accepted: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.Entries[action.Key].RemoteHash != remoteMarkdownHash("# New") {
+				t.Fatal("baseline did not use final readback")
+			}
+			if _, err := validateExisting(context.Background(), client, state.Entries[action.Key]); err != nil {
+				t.Fatalf("unchanged readback conflicted: %v", err)
+			}
+		})
+	}
+}

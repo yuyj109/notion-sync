@@ -1,13 +1,9 @@
 package sync
 
 import (
-	"compress/flate"
 	"context"
-	"encoding/base64"
 	"encoding/json"
-	"encoding/xml"
 	"fmt"
-	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -18,8 +14,10 @@ import (
 )
 
 type embedTestClient struct {
-	body    map[string]any
-	uploads int
+	body         map[string]any
+	uploads      int
+	onUpload     func(string, string, string) error
+	uploadedPath string
 }
 
 type managedEmbedClient struct {
@@ -100,8 +98,14 @@ func (c *managedEmbedClient) API(_ context.Context, method, endpoint string, _ a
 	return json.Unmarshal(b, out)
 }
 
-func (c *embedTestClient) Upload(context.Context, string, string, string) (string, error) {
+func (c *embedTestClient) Upload(_ context.Context, name, contentType, path string) (string, error) {
 	c.uploads++
+	c.uploadedPath = path
+	if c.onUpload != nil {
+		if err := c.onUpload(name, contentType, path); err != nil {
+			return "", err
+		}
+	}
 	return "upload", nil
 }
 
@@ -111,7 +115,7 @@ func (c *embedTestClient) API(_ context.Context, _, _ string, body any, out any)
 	return json.Unmarshal(b, out)
 }
 
-func TestDrawioExportAndEmptyEmbed(t *testing.T) {
+func TestDrawioExportAndHTMLEmbed(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", filepath.Join(dir, "home"))
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
@@ -124,41 +128,53 @@ func TestDrawioExportAndEmptyEmbed(t *testing.T) {
 	action := Action{File: File{Images: []Image{image}}}
 	var cfg config.Config
 	cfg.SourcePath, cfg.WorkDir, cfg.Sync.DrawioEmbed = dir, dir, true
-	output := filepath.Join(filepath.Dir(testSharedStatePath(t, cfg, rootID)), name+".txt")
+	output := filepath.Join(filepath.Dir(testSharedStatePath(t, cfg, rootID)), name+".html")
 	legacy := filepath.Join(dir, ".notion-sync", name+".txt")
 	write(t, legacy, "old output")
-	if err := exportDrawioURL(cfg, Plan{Actions: []Action{action}}, false, nil); err != nil {
+	if err := exportDrawioHTML(cfg, Plan{Actions: []Action{action}}, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Dir(output)); !os.IsNotExist(err) {
 		t.Fatalf("dry-run created output directory: %v", err)
 	}
-	if err := exportDrawioURL(cfg, Plan{Actions: []Action{action}}, true, nil); err != nil {
+	if err := exportDrawioHTML(cfg, Plan{Actions: []Action{action}}, true, nil); err != nil {
 		t.Fatal(err)
 	}
 	if string(mustRead(t, legacy)) != "old output" {
 		t.Fatal("legacy output was modified")
 	}
 	html, err := os.ReadFile(output)
-	if err != nil || !strings.HasPrefix(string(html), "https://viewer.diagrams.net/") || !strings.Contains(string(html), "%3Cmxfile%3E") {
+	if err != nil || !strings.HasPrefix(string(html), "<!doctype html>") || !strings.Contains(string(html), `id="diagram-data"`) {
 		t.Fatalf("unexpected HTML: %s, %v", html, err)
 	}
 	client := &embedTestClient{}
+	client.onUpload = func(filename, contentType, path string) error {
+		if filename != name+".html" || contentType != "text/html" || string(mustRead(t, path)) != string(html) {
+			t.Fatal("upload must contain the rendered HTML with its filename and MIME type")
+		}
+		return nil
+	}
 	blocks, err := appendImages(context.Background(), client, rootID, action, cfg)
-	if err != nil || client.uploads != 0 || blocks["image-1"] != rootID {
+	if err != nil || client.uploads != 1 || blocks["image-1"] != rootID {
 		t.Fatalf("embed: blocks=%v uploads=%d err=%v", blocks, client.uploads, err)
 	}
 	child := client.body["children"].([]any)[0].(map[string]any)
-	if child["type"] != "embed" || child["embed"].(map[string]any)["url"] != "" {
+	if child["type"] != "embed" || child["embed"].(map[string]any)["file_upload"].(map[string]any)["id"] != "upload" {
 		t.Fatalf("unexpected block: %v", child)
+	}
+	if _, ok := child["embed"].(map[string]any)["url"]; ok {
+		t.Fatal("HTML embed must use only file_upload")
+	}
+	if _, err := os.Stat(client.uploadedPath); !os.IsNotExist(err) {
+		t.Fatalf("temporary HTML not removed: %v", err)
 	}
 	if err := os.WriteFile(output, []byte("user content"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := exportDrawioURL(cfg, Plan{Actions: []Action{action}}, false, nil); err == nil {
+	if err := exportDrawioHTML(cfg, Plan{Actions: []Action{action}}, false, nil); err == nil {
 		t.Fatal("dry-run must detect collision")
 	}
-	if err := exportDrawioURL(cfg, Plan{Actions: []Action{action}}, true, nil); err == nil {
+	if err := exportDrawioHTML(cfg, Plan{Actions: []Action{action}}, true, nil); err == nil {
 		t.Fatal("expected collision error")
 	}
 	got, _ := os.ReadFile(output)
@@ -167,7 +183,7 @@ func TestDrawioExportAndEmptyEmbed(t *testing.T) {
 	}
 }
 
-func TestRestoreMissingManagedDrawioURL(t *testing.T) {
+func TestRestoreMissingManagedDrawioHTML(t *testing.T) {
 	c, _, dir := setup(t)
 	name := "diagram.drawio.svg"
 	source := `<svg xmlns="http://www.w3.org/2000/svg" content="&lt;mxfile&gt;&lt;diagram&gt;&lt;mxGraphModel&gt;&lt;root/&gt;&lt;/mxGraphModel&gt;&lt;/diagram&gt;&lt;/mxfile&gt;"/>`
@@ -176,31 +192,31 @@ func TestRestoreMissingManagedDrawioURL(t *testing.T) {
 	blockID := "11111111-1111-1111-1111-111111111111"
 	entry := Entry{ImageBlocks: map[string]string{"image-1": blockID}, ImageHashes: map[string]string{"image-1": hash("drawio-embed:" + image.Hash)}, managedEmbeds: map[string]bool{norm(blockID): true}}
 	plan := Plan{Actions: []Action{{Kind: "unchanged", File: File{Images: []Image{image}}, Entry: entry}}}
-	output := filepath.Join(filepath.Dir(testSharedStatePath(t, c, rootID)), name+".txt")
+	output := filepath.Join(filepath.Dir(testSharedStatePath(t, c, rootID)), name+".html")
 	var preview strings.Builder
-	if err := exportDrawioURL(c, plan, false, func(format string, args ...any) { fmt.Fprintf(&preview, format+"\n", args...) }); err != nil {
+	if err := exportDrawioHTML(c, plan, false, func(format string, args ...any) { fmt.Fprintf(&preview, format+"\n", args...) }); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(output); !os.IsNotExist(err) || !strings.Contains(preview.String(), output) {
 		t.Fatalf("dry-run did not preview output without writing: %s %v", preview.String(), err)
 	}
 	var result strings.Builder
-	if err := exportDrawioURL(c, plan, true, func(format string, args ...any) { fmt.Fprintf(&result, format+"\n", args...) }); err != nil {
+	if err := exportDrawioHTML(c, plan, true, func(format string, args ...any) { fmt.Fprintf(&result, format+"\n", args...) }); err != nil {
 		t.Fatal(err)
 	}
-	url := strings.TrimSpace(string(mustRead(t, output)))
-	if !strings.HasPrefix(url, "https://viewer.diagrams.net/") || !strings.Contains(result.String(), url) {
-		t.Fatal("missing restored URL")
+	html := string(mustRead(t, output))
+	if !strings.HasPrefix(html, "<!doctype html>") || !strings.Contains(result.String(), output) || strings.Contains(result.String(), html) {
+		t.Fatal("missing restored HTML or contents leaked into output")
 	}
 	write(t, output, "do not replace")
-	if err := exportDrawioURL(c, plan, true, nil); err != nil || string(mustRead(t, output)) != "do not replace" {
+	if err := exportDrawioHTML(c, plan, true, nil); err != nil || string(mustRead(t, output)) != "do not replace" {
 		t.Fatalf("existing URL was not preserved: %v", err)
 	}
 	if err := os.Remove(output); err != nil {
 		t.Fatal(err)
 	}
 	entry.ImageHashes["image-1"] = hash("drawio-embed:previous-diagram")
-	if err := exportDrawioURL(c, plan, true, nil); err != nil {
+	if err := exportDrawioHTML(c, plan, true, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(output); !os.IsNotExist(err) {
@@ -211,81 +227,8 @@ func TestRestoreMissingManagedDrawioURL(t *testing.T) {
 	plan.Actions[0].File.Images[0].Hash = hash(invalid)
 	entry.ImageHashes["image-1"] = hash("drawio-embed:" + hash(invalid))
 	var warning strings.Builder
-	if err := exportDrawioURL(c, plan, true, func(format string, args ...any) { fmt.Fprintf(&warning, format+"\n", args...) }); err != nil || !strings.Contains(warning.String(), "cannot restore") {
+	if err := exportDrawioHTML(c, plan, true, func(format string, args ...any) { fmt.Fprintf(&warning, format+"\n", args...) }); err != nil || !strings.Contains(warning.String(), "cannot restore") {
 		t.Fatalf("invalid existing diagram should warn without blocking: %v, %s", err, warning.String())
-	}
-}
-
-func TestDrawioMissingMetadata(t *testing.T) {
-	if _, err := drawioViewerURL([]byte(`<svg xmlns="http://www.w3.org/2000/svg"/>`), "diagram.drawio.svg"); err == nil {
-		t.Fatal("expected error for missing editable diagram")
-	}
-}
-
-func TestDrawioViewerUsesCompressedModel(t *testing.T) {
-	model := `<mxGraphModel><root><mxCell id="0" value="A &amp; B"/></root></mxGraphModel>`
-	input := `<mxfile host="app.diagrams.net"><diagram name="図" id="p1">` + model + `</diagram></mxfile>`
-	encoded, err := encodeDrawioXML(input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var output struct {
-		Diagrams []struct {
-			Name string `xml:"name,attr"`
-			ID   string `xml:"id,attr"`
-			Data string `xml:",chardata"`
-		} `xml:"diagram"`
-	}
-	if err := xml.Unmarshal([]byte(encoded), &output); err != nil || len(output.Diagrams) != 1 {
-		t.Fatalf("invalid output XML: %v", err)
-	}
-	page := output.Diagrams[0]
-	if page.Name != "図" || page.ID != "p1" {
-		t.Fatalf("lost diagram identity: %+v", page)
-	}
-	data, err := base64.StdEncoding.DecodeString(page.Data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r := flate.NewReader(strings.NewReader(string(data)))
-	defer func() {
-		if err := r.Close(); err != nil {
-			t.Errorf("close compressed diagram: %v", err)
-		}
-	}()
-	compressed, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	decoded, err := url.QueryUnescape(string(compressed))
-	if err != nil || decoded != model {
-		t.Fatalf("model did not round-trip: %q, %v", decoded, err)
-	}
-}
-
-func TestDrawioExportKeepsLongURL(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("HOME", filepath.Join(dir, "home"))
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
-	source := `<svg xmlns="http://www.w3.org/2000/svg" content="&lt;mxfile&gt;&lt;diagram&gt;` + strings.Repeat("a", 2200) + `&lt;/diagram&gt;&lt;/mxfile&gt;"/>`
-	name := "large.drawio.svg"
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(source), 0600); err != nil {
-		t.Fatal(err)
-	}
-	image := Image{Name: name, Path: name, Hash: hash(source)}
-	var cfg config.Config
-	cfg.SourcePath, cfg.WorkDir = dir, dir
-	var warning string
-	err := exportDrawioURL(cfg, Plan{Actions: []Action{{File: File{Images: []Image{image}}}}}, true, func(format string, args ...any) { warning += fmt.Sprintf(format, args...) + "\n" })
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(filepath.Join(filepath.Dir(testSharedStatePath(t, cfg, rootID)), name+".txt"))
-	if err != nil || len(data) <= 2000 {
-		t.Fatalf("long URL not exported: length=%d err=%v", len(data), err)
-	}
-	if !strings.Contains(warning, "Notion may reject") {
-		t.Fatalf("missing length warning: %q", warning)
 	}
 }
 
@@ -504,7 +447,7 @@ func TestUpdateTextAroundExistingDrawioEmbed(t *testing.T) {
 	state.Active["home.md"] = true
 	state.Entries["file:home.md"] = entry
 	action := Action{Kind: "update", Key: "file:home.md", Path: "home.md", Entry: entry, File: file, TextParts: parts}
-	if err := exportDrawioURL(cfg, Plan{Actions: []Action{action}}, true, nil); err != nil {
+	if err := exportDrawioHTML(cfg, Plan{Actions: []Action{action}}, true, nil); err != nil {
 		t.Fatalf("existing embed should skip diagram export: %v", err)
 	}
 	if err := Apply(context.Background(), cfg, client, &state, Plan{Actions: []Action{action}}, func(string, ...any) {}); err != nil {
@@ -611,7 +554,7 @@ func TestReplaceEmbedsDoesNotForceOrdinaryPage(t *testing.T) {
 		t.Fatal(err)
 	}
 	state.Entries["file:home.md"] = Entry{PageID: id, ParentID: rootID, ParentType: "page_id", Target: "hierarchy:", LocalHash: "old", RemoteHash: remoteMarkdownHash("old"), ImageHashes: map[string]string{"image-1": "old image"}}
-	plan, err := Build(context.Background(), cfg, api, files, state, true)
+	plan, err := Build(context.Background(), cfg, api, files, state, false)
 	if err != nil || len(plan.Actions) != 1 || plan.Actions[0].ForceReplace {
 		t.Fatalf("ordinary page was forced: %+v, %v", plan, err)
 	}
@@ -788,7 +731,7 @@ func TestSkippedEmbedPageDoesNotBlockOtherPages(t *testing.T) {
 	}
 }
 
-func TestSkippedPageDoesNotExportURLOrBlockOtherUpdates(t *testing.T) {
+func TestSkippedPageDoesNotExportHTMLOrBlockOtherUpdates(t *testing.T) {
 	cfg, base, dir := setup(t)
 	cfg.Sync.DrawioEmbed = true
 	diagram := `<svg xmlns="http://www.w3.org/2000/svg" content="&lt;mxfile&gt;&lt;diagram&gt;&lt;mxGraphModel&gt;&lt;root/&gt;&lt;/mxGraphModel&gt;&lt;/diagram&gt;&lt;/mxfile&gt;"/>`
@@ -813,7 +756,7 @@ func TestSkippedPageDoesNotExportURLOrBlockOtherUpdates(t *testing.T) {
 	}
 	write(t, home, string(mustRead(t, home))+"\n![new](new.drawio.svg)\n")
 	write(t, other, strings.Replace(string(mustRead(t, other)), "# Old\n", "# New\n", 1))
-	output := filepath.Join(filepath.Dir(testSharedStatePath(t, cfg, rootID)), "new.drawio.svg.txt")
+	output := filepath.Join(filepath.Dir(testSharedStatePath(t, cfg, rootID)), "new.drawio.svg.html")
 	write(t, output, "do not overwrite")
 	client := &embedAndPagesClient{fakeAPI: base, embedID: embedID}
 	for _, apply := range []bool{false, true} {
@@ -837,6 +780,9 @@ type linkPreviewClient struct {
 func (c *linkPreviewClient) API(ctx context.Context, method, endpoint string, body any, out any) error {
 	if method == "GET" && strings.HasSuffix(endpoint, "/children?page_size=100") {
 		data, _ := json.Marshal(map[string]any{"results": []any{map[string]any{"id": c.embedID, "type": "embed"}}, "has_more": false})
+		if len(c.imageBlocks) > 0 {
+			return c.forceReplaceEmbedClient.API(ctx, method, endpoint, body, out)
+		}
 		return json.Unmarshal(data, out)
 	}
 	return c.forceReplaceEmbedClient.API(ctx, method, endpoint, body, out)
@@ -994,9 +940,15 @@ func TestImageUpdateRejectsUnverifiableProxyBeforeUpload(t *testing.T) {
 }
 
 func (c *forceReplaceEmbedClient) API(ctx context.Context, method, endpoint string, body any, out any) error {
+	if method == "GET" && strings.HasSuffix(endpoint, "/children?page_size=100") {
+		data, _ := json.Marshal(map[string]any{"results": []any{map[string]any{"id": "33333333-3333-3333-3333-333333333333", "type": "embed"}}, "has_more": false})
+		return json.Unmarshal(data, out)
+	}
 	if method == "PATCH" && strings.HasSuffix(endpoint, "/children") {
 		child := body.(map[string]any)["children"].([]any)[0].(map[string]any)
 		c.imageBlocks = append(c.imageBlocks, child)
+		pageID := strings.TrimSuffix(strings.TrimPrefix(endpoint, "v1/blocks/"), "/children")
+		c.pages[norm(pageID)].content += "\n<embed src=\"https://files.example/diagram.html?token=first\">diagram caption</embed>"
 		b, _ := json.Marshal(map[string]any{"results": []any{map[string]any{"id": "33333333-3333-3333-3333-333333333333", "type": child["type"]}}})
 		return json.Unmarshal(b, out)
 	}
@@ -1027,13 +979,13 @@ func TestPreviewAndApplyLinkDependentEmbedReplacement(t *testing.T) {
 	if err := Run(context.Background(), cfg, client, false, func(format string, args ...any) { fmt.Fprintf(&preview, format+"\n", args...) }, true); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(preview.String(), "new page links will change") || !strings.Contains(preview.String(), "embeds recreated empty") {
+	if !strings.Contains(preview.String(), "new page links will change") || !strings.Contains(preview.String(), "embeds recreated from uploaded HTML") {
 		t.Fatalf("missing replacement preview: %s", preview.String())
 	}
 	if base.creates != 0 || base.updates != 0 {
 		t.Fatal("dry-run modified Notion")
 	}
-	output := filepath.Join(filepath.Dir(testSharedStatePath(t, cfg, rootID)), "diagram.drawio.svg.txt")
+	output := filepath.Join(filepath.Dir(testSharedStatePath(t, cfg, rootID)), "diagram.drawio.svg.html")
 	write(t, output, "user content")
 	for _, apply := range []bool{false, true} {
 		if err := Run(context.Background(), cfg, client, apply, func(string, ...any) {}, true); err == nil || !strings.Contains(err.Error(), "already exists with different content") {
@@ -1086,7 +1038,7 @@ func TestReplaceEmbedsDetectsDiagramOnlyChange(t *testing.T) {
 	}
 }
 
-func TestPushReplacesPageAndRecreatesEmptyDrawioEmbed(t *testing.T) {
+func TestPushReplacesPageAndRecreatesHTMLDrawioEmbed(t *testing.T) {
 	cfg, api, dir := setup(t)
 	cfg.Sync.DrawioEmbed = true
 	cfg.Sync.ReplaceDrawioEmbeds = true
@@ -1125,10 +1077,10 @@ func TestPushReplacesPageAndRecreatesEmptyDrawioEmbed(t *testing.T) {
 	cfg.Sync.ReplaceDrawioEmbeds = true
 	var preview strings.Builder
 	printPlan(plan, func(format string, args ...any) { fmt.Fprintf(&preview, format, args...) })
-	if !strings.Contains(preview.String(), "embeds recreated empty") {
+	if !strings.Contains(preview.String(), "embeds recreated from uploaded HTML") {
 		t.Fatalf("missing preview: %s", preview.String())
 	}
-	if err := exportDrawioURL(cfg, plan, true, nil); err != nil {
+	if err := exportDrawioHTML(cfg, plan, true, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := Apply(context.Background(), cfg, client, &state, plan, func(string, ...any) {}); err != nil {
@@ -1137,10 +1089,234 @@ func TestPushReplacesPageAndRecreatesEmptyDrawioEmbed(t *testing.T) {
 	if got := api.pages[norm(id)].content; strings.Contains(got, "Old") || strings.Contains(got, "manual") || !strings.Contains(got, "New body") {
 		t.Fatalf("page not replaced: %q", got)
 	}
-	if len(api.imageBlocks) != 1 || api.imageBlocks[0]["type"] != "embed" || api.imageBlocks[0]["embed"].(map[string]any)["url"] != "" {
-		t.Fatalf("embed not recreated empty: %+v", api.imageBlocks)
+	if len(api.imageBlocks) != 1 || api.imageBlocks[0]["type"] != "embed" || api.imageBlocks[0]["embed"].(map[string]any)["file_upload"].(map[string]any)["id"] != "22222222-2222-2222-2222-222222222222" {
+		t.Fatalf("HTML embed not recreated: %+v", api.imageBlocks)
 	}
 	if state.Entries["file:home.md"].ImageBlocks["image-1"] != "33333333-3333-3333-3333-333333333333" {
 		t.Fatal("new block not saved")
+	}
+}
+
+func TestDrawioHTMLUploadFailureDoesNotAttach(t *testing.T) {
+	for _, mode := range []string{"upload failure", "source changed", "invalid diagram"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg, _, dir := setup(t)
+			cfg.Sync.DrawioEmbed = true
+			name := "diagram.drawio.svg"
+			source := `<svg content="&lt;mxGraphModel&gt;&lt;root/&gt;&lt;/mxGraphModel&gt;"/>`
+			if mode == "invalid diagram" {
+				source = `<svg/>`
+			}
+			write(t, filepath.Join(dir, name), source)
+			client := &embedTestClient{onUpload: func(_, _, _ string) error {
+				if mode == "source changed" {
+					write(t, filepath.Join(dir, name), "changed during upload")
+					return nil
+				}
+				return fmt.Errorf("lost upload response")
+			}}
+			action := Action{File: File{Images: []Image{{Name: name, Path: name, Hash: hash(source)}}}}
+			_, err := appendImages(context.Background(), client, rootID, action, cfg)
+			if err == nil || client.body != nil || client.uploads > 1 {
+				t.Fatalf("failed upload must stop without attachment or retry: err=%v uploads=%d", err, client.uploads)
+			}
+		})
+	}
+}
+
+func TestDrawioHTMLSyncReusesNormalizedBaseline(t *testing.T) {
+	for _, singleFile := range []bool{false, true} {
+		t.Run(fmt.Sprint("singleFile=", singleFile), func(t *testing.T) {
+			cfg, base, dir := setup(t)
+			cfg.Sync.DrawioEmbed = true
+			file := filepath.Join(dir, "home.md")
+			write(t, file, "# Home\n\n![diagram](diagram.drawio.svg)\n")
+			write(t, filepath.Join(dir, "diagram.drawio.svg"), `<svg content="&lt;mxGraphModel&gt;&lt;root/&gt;&lt;/mxGraphModel&gt;"/>`)
+			client := &forceReplaceEmbedClient{fakeUploader: &fakeUploader{fakeAPI: base}}
+			var log strings.Builder
+			print := func(format string, args ...any) { fmt.Fprintf(&log, format+"\n", args...) }
+			run := func(apply bool) error {
+				if singleFile {
+					return RunFile(context.Background(), cfg, client, file, apply, print)
+				}
+				return Run(context.Background(), cfg, client, apply, print)
+			}
+			output := filepath.Join(filepath.Dir(testSharedStatePath(t, cfg, rootID)), "diagram.drawio.svg.html")
+			if err := run(false); err != nil {
+				t.Fatal(err)
+			}
+			if base.creates != 0 || base.updates != 0 || client.uploads != 0 {
+				t.Fatal("dry-run wrote to Notion")
+			}
+			if _, err := os.Stat(output); !os.IsNotExist(err) {
+				t.Fatalf("dry-run created HTML: %v", err)
+			}
+			if err := run(true); err != nil {
+				t.Fatal(err)
+			}
+			if client.uploads != 1 || !strings.HasPrefix(string(mustRead(t, output)), "<!doctype html>") {
+				t.Fatal("HTML not generated and uploaded")
+			}
+			state, err := loadState(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entry := state.Entries["file:home.md"]
+			remote := base.pages[norm(entry.PageID)]
+			remote.content = strings.Replace(remote.content, "token=first", "token=refreshed", 1)
+			updates := base.updates
+			if err := run(true); err != nil {
+				t.Fatalf("refreshed signed URL caused conflict: %v", err)
+			}
+			if client.uploads != 1 || base.updates != updates || strings.Contains(log.String(), "token=") || strings.Contains(log.String(), "<!doctype") {
+				t.Fatal("rerun wrote unchanged media or logged private content")
+			}
+			remote.content += "\nremote edit"
+			if err := run(false); err == nil {
+				t.Fatal("unrelated remote edit must conflict")
+			}
+		})
+	}
+}
+
+type removalEmbedClient struct {
+	*fakeAPI
+	imageID, embedID string
+}
+
+func (c *removalEmbedClient) API(ctx context.Context, method, endpoint string, body any, out any) error {
+	if method == "GET" && strings.HasSuffix(endpoint, "/children?page_size=100") {
+		data, _ := json.Marshal(map[string]any{"results": []any{map[string]any{"id": c.imageID, "type": "image"}, map[string]any{"id": c.embedID, "type": "embed"}}, "has_more": false})
+		return json.Unmarshal(data, out)
+	}
+	return c.fakeAPI.API(ctx, method, endpoint, body, out)
+}
+
+func TestPushRemovesMediaWithExpiringEmbedURL(t *testing.T) {
+	for _, concurrent := range []bool{false, true} {
+		t.Run(fmt.Sprint("concurrent=", concurrent), func(t *testing.T) {
+			cfg, base, dir := setup(t)
+			cfg.Sync.DrawioEmbed = true
+			write(t, filepath.Join(dir, "home.md"), "# Local\n")
+			state, err := loadState(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, imageID, embedID := "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"
+			remote := "# Remote\n![photo](https://files.example/photo.svg)\n<embed src=\"https://files.example/diagram.html?token=old\"></embed>"
+			base.pages[norm(id)] = &fakePage{parent: rootID, parentType: "page_id", content: remote}
+			state.Active["home.md"] = true
+			state.Entries["file:home.md"] = Entry{PageID: id, ParentID: rootID, ParentType: "page_id", Target: "hierarchy:", LocalHash: "old", RemoteHash: remoteMarkdownHash("# previous"), ImageHashes: map[string]string{"image-1": "old", "image-2": "old"}, ImageBlocks: map[string]string{"image-1": imageID, "image-2": embedID}}
+			client := &removalEmbedClient{fakeAPI: base, imageID: imageID, embedID: embedID}
+			files := []File{*state.Documents["home.md"]}
+			if _, err := Build(context.Background(), cfg, client, files, state, false); err == nil {
+				t.Fatal("conflict must fail without push")
+			}
+			plan, err := Build(context.Background(), cfg, client, files, state, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !plan.Actions[0].RemoveMedia || !plan.Actions[0].ForceReplace {
+				t.Fatal("missing deletion plan")
+			}
+			var preview strings.Builder
+			printPlan(plan, func(format string, args ...any) { fmt.Fprintf(&preview, format, args...) })
+			if !strings.Contains(preview.String(), "removed media deleted") {
+				t.Fatal("missing deletion preview")
+			}
+			if err := previewActions(context.Background(), cfg, client, plan, func(string, ...any) {}); err != nil || base.updates != 0 {
+				t.Fatalf("dry-run: %v", err)
+			}
+			base.pages[norm(id)].content = strings.Replace(remote, "token=old", "token=new", 1)
+			if concurrent {
+				base.pages[norm(id)].content += "\nconcurrent edit"
+			}
+			err = Apply(context.Background(), cfg, client, &state, plan, func(string, ...any) {})
+			if concurrent {
+				if err == nil || base.updates != 0 {
+					t.Fatalf("concurrent change accepted: %v", err)
+				}
+				return
+			}
+			if err != nil || base.updates != 1 || base.pages[norm(id)].content != "# Local\n" || len(state.Entries["file:home.md"].ImageHashes) != 0 {
+				t.Fatalf("removal failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestOverwriteSnapshotNormalizesOnlyNotionEmbedSignatures(t *testing.T) {
+	url1 := "https://prod-files-secure.s3.us-west-2.amazonaws.com/space/file/diagram.html?X-Amz-Signature=one&x-id=GetObject#notion_record=block.example"
+	url2 := strings.Replace(url1, "Signature=one", "Signature=two", 1)
+	body := func(u string) string { return `<embed src="` + u + `"></embed>` }
+	if overwriteMarkdownHash(body(url1)) != overwriteMarkdownHash(body(url2)) {
+		t.Fatal("refreshed signature changed snapshot")
+	}
+	for _, changed := range []string{strings.Replace(url2, "/file/", "/other/", 1), strings.Replace(url2, "x-id=GetObject", "x-id=Other", 1), "https://example.com/diagram?X-Amz-Signature=two"} {
+		if overwriteMarkdownHash(body(url1)) == overwriteMarkdownHash(body(changed)) {
+			t.Fatalf("different content accepted: %s", changed)
+		}
+	}
+	if overwriteMarkdownHash("```\n"+body(url1)+"\n```") == overwriteMarkdownHash("```\n"+body(url2)+"\n```") {
+		t.Fatal("code block content must not be normalized")
+	}
+}
+
+func TestPushRemovalWithoutMediaMetadataHandlesRefreshedEmbedURL(t *testing.T) {
+	cfg, base, dir := setup(t)
+	cfg.Sync.DrawioEmbed = true
+	write(t, filepath.Join(dir, "home.md"), "# Local\n")
+	state, err := loadState(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "11111111-1111-1111-1111-111111111111"
+	remote := "# Remote\n<embed src=\"https://prod-files-secure.s3.us-west-2.amazonaws.com/space/file/diagram.html?X-Amz-Signature=one\"></embed>"
+	base.pages[norm(id)] = &fakePage{parent: rootID, parentType: "page_id", content: remote}
+	state.Active["home.md"] = true
+	state.Entries["file:home.md"] = Entry{PageID: id, ParentID: rootID, ParentType: "page_id", Target: "hierarchy:", LocalHash: "old", RemoteHash: remoteMarkdownHash("# Previous")}
+	plan, err := Build(context.Background(), cfg, base, []File{*state.Documents["home.md"]}, state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var preview strings.Builder
+	printPlan(plan, func(format string, args ...any) { fmt.Fprintf(&preview, format, args...) })
+	if !strings.Contains(preview.String(), "all page content replaced") {
+		t.Fatal("replacement was not previewed")
+	}
+	base.pages[norm(id)].content = strings.Replace(remote, "Signature=one", "Signature=two", 1)
+	if err := Apply(context.Background(), cfg, base, &state, plan, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	if base.updates != 1 || base.pages[norm(id)].content != "# Local\n" {
+		t.Fatal("page was not updated")
+	}
+}
+
+func TestCaptionedManagedEmbedNormalizationAndConflict(t *testing.T) {
+	id := "11111111-1111-1111-1111-111111111111"
+	remote := `before
+<embed src="https://files.example/diagram.html?token=first">diagram caption</embed>
+after`
+	client := &managedEmbedClient{markdown: remote, children: []any{map[string]any{"id": id, "type": "embed"}}}
+	entry := Entry{PageID: rootID, ParentID: rootID, ParentType: "page_id", RemoteHash: remoteMarkdownHash(strings.Replace(remote, "https://files.example/diagram.html?token=first", "", 1)), managedEmbeds: map[string]bool{norm(id): true}}
+	client.markdown = strings.Replace(remote, "token=first", "token=second", 1)
+	if _, err := validateExisting(context.Background(), client, entry); err != nil {
+		t.Fatalf("refreshed URL conflicted: %v", err)
+	}
+	client.markdown = strings.Replace(client.markdown, "diagram caption", "changed caption", 1)
+	if _, err := validateExisting(context.Background(), client, entry); err == nil {
+		t.Fatal("changed caption must conflict")
+	}
+}
+
+func TestOverwriteSnapshotNormalizesCaptionedNotionEmbed(t *testing.T) {
+	body := `<embed src="https://prod-files-secure.s3.us-west-2.amazonaws.com/space/file/diagram.html?X-Amz-Signature=one">caption</embed>`
+	rotated := strings.Replace(body, "Signature=one", "Signature=two", 1)
+	if overwriteMarkdownHash(body) != overwriteMarkdownHash(rotated) {
+		t.Fatal("captioned embed signature was not normalized")
+	}
+	if overwriteMarkdownHash(body) == overwriteMarkdownHash(strings.Replace(rotated, "caption", "different", 1)) {
+		t.Fatal("caption change was ignored")
 	}
 }
